@@ -1,0 +1,8 @@
+numpy
+pandas
+scikit-learn
+mendeleev
+xgboost
+lightgbm
+joblib
+lazypredict

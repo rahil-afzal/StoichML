@@ -95,7 +95,8 @@ def safe_weighted_stats(values, weights):
         "std": np.sqrt(var),
         "min": float(vals.min()),
         "max": float(vals.max()),
-        "range": float(vals.ptp())
+        "range": float(np.ptp(vals))
+
     }
 
 # ---------- Featurizer ----------
