@@ -8,7 +8,6 @@ from stoichml.utils import load_and_featurize
 FEAT_PATH = "data/data_feat.pkl"
 RAW_PATH  = "data/data.pkl"
 
-
 def load_or_featurize():
     if os.path.exists(FEAT_PATH):
         print(f"Loading featurized data from: {FEAT_PATH}")
