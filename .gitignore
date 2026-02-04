@@ -1,2 +1,5 @@
 data\data_feat.pkl
 stoichml\__pycache__
+data\selected_features.json
+data\.ipynb_checkpoints
+data\test.ipynb
