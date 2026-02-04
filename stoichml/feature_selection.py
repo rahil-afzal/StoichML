@@ -1,38 +1,42 @@
-"""
-feature_selection.py
---------------------
-LightGBM-based feature pruning for StoichML.
-
-Pipeline:
-1. Drop non-feature columns
-2. Sanitize data (inf/-inf)
-3. Variance filtering
-4. Drop constant columns
-5. LightGBM importance pruning (train-only)
-6. Save selected features
-"""
+# feature_pruning_lgbm.py
 
 import os
 import json
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
-
-# -------------------------------
-# User parameters
-# -------------------------------
+# ===============================
+# Config
+# ===============================
 INPUT_PATH = "data/data_feat.pkl"
-OUTPUT_FEATURES_JSON = "data/selected_features.json"
+OUTPUT_JSON = "data/selected_features.json"
 
-TARGET_COL = "enthalpy_formation_atom"   # change as needed
-TEST_SIZE = 0.2
 RANDOM_STATE = 42
+TEST_SIZE = 0.2
+CUM_IMPORTANCE = 0.85
 
-VARIANCE_QUANTILE = 0.10
-IMPORTANCE_CUTOFF = 0.80   # keep top 80% cumulative importance
+TARGETS = {
+    "enthalpy": {
+        "col": "enthalpy_formation_atom",
+        "task": "regression"
+    },
+    "egap": {
+        "col": "Egap",
+        "task": "regression",
+        "log": True
+    },
+    "egap_type": {
+        "col": "Egap_type_numeric",
+        "task": "binary"
+    },
+    "hm_class": {
+        "col": "hm_class",
+        "task": "multiclass"
+    }
+}
 
 NON_FEATURE_COLS = [
     "compound",
@@ -40,6 +44,7 @@ NON_FEATURE_COLS = [
     "Egap",
     "Egap_type",
     "Egap_type_numeric",
+    "enthalpy_formation_atom",
     "composition",
     "elements",
     "hm_class",
@@ -57,102 +62,128 @@ PHYSICS_FEATURES = {
     "tm_frac",
 }
 
-
-# -------------------------------
+# ===============================
 # Helpers
-# -------------------------------
-def variance_filter(X, quantile=0.1, plot=True):
-    var = X.var()
-    thr = var.quantile(quantile)
-
-    if plot:
-        plt.hist(var, bins=40)
-        plt.axvline(thr, color="r", linestyle="--")
-        plt.title("Feature variance distribution")
-        plt.show()
-
-    return X.loc[:, var > thr]
+# ===============================
+def sanitize(X):
+    X = X.replace([np.inf, -np.inf], np.nan)
+    return X.dropna(axis=1)
 
 
-def lgbm_prune(X, y):
+def lgbm_model(task, y):
+    if task == "regression":
+        return lgb.LGBMRegressor(
+            n_estimators=700,
+            learning_rate=0.05,
+            max_depth=7,
+            num_leaves=31,
+            min_data_in_leaf=30,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=RANDOM_STATE,
+        )
+
+    if task == "binary":
+        return lgb.LGBMClassifier(
+            n_estimators=600,
+            learning_rate=0.05,
+            max_depth=7,
+            num_leaves=31,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        )
+
+    if task == "multiclass":
+        classes = np.unique(y)
+        weights = compute_class_weight(
+            class_weight="balanced",
+            classes=classes,
+            y=y
+        )
+        class_weight = dict(zip(classes, weights))
+
+        # amplify rare class (class 2)
+        if 2 in class_weight:
+            class_weight[2] *= 2.0
+
+        return lgb.LGBMClassifier(
+            n_estimators=700,
+            learning_rate=0.05,
+            max_depth=7,
+            num_leaves=31,
+            class_weight=class_weight,
+            random_state=RANDOM_STATE,
+        )
+
+
+def prune_features(X, y, cfg):
+    if cfg.get("log", False):
+        y = np.log1p(y.clip(lower=0))
+
     X_tr, X_val, y_tr, y_val = train_test_split(
         X, y,
         test_size=TEST_SIZE,
-        random_state=RANDOM_STATE
-    )
-
-    model = lgb.LGBMRegressor(
-        n_estimators=600,
-        learning_rate=0.05,
-        max_depth=7,
-        num_leaves=31,
-        min_data_in_leaf=30,
-        subsample=0.8,
-        colsample_bytree=0.8,
         random_state=RANDOM_STATE,
+        stratify=y if cfg["task"] != "regression" else None
     )
 
-    model.fit(
-        X_tr, y_tr,
-        eval_set=[(X_val, y_val)],
-        eval_metric="rmse"
-    )
+    model = lgbm_model(cfg["task"], y_tr)
+    model.fit(X_tr, y_tr)
 
     imp = pd.Series(
         model.feature_importances_,
         index=X.columns
     ).sort_values(ascending=False)
 
-    imp_norm = imp / imp.sum()
-    keep = imp_norm.cumsum() <= IMPORTANCE_CUTOFF
+    imp = imp / imp.sum()
+    keep = imp.cumsum() <= CUM_IMPORTANCE
 
-    selected = set(imp_norm[keep].index)
+    selected = set(imp[keep].index)
 
-    # Always keep physics features if they have nonzero importance
-    phys_keep = {
+    # retain physics features if they carry signal
+    selected |= {
         f for f in PHYSICS_FEATURES
-        if f in imp_norm.index and imp_norm[f] > 0
+        if f in imp.index and imp[f] > 0
     }
 
-    return sorted(selected | phys_keep)
+    return sorted(selected)
 
 
-# -------------------------------
+# ===============================
 # Main
-# -------------------------------
+# ===============================
 if __name__ == "__main__":
 
     df = pd.read_pickle(INPUT_PATH)
 
-    y = df[TARGET_COL]
+    results = {}
+    all_sets = []
 
-    X = df.drop(
-        columns=[c for c in NON_FEATURE_COLS + [TARGET_COL] if c in df.columns],
-        errors="ignore",
-    )
+    for name, cfg in TARGETS.items():
+        y = df[cfg["col"]]
 
-    print(f"Initial feature count: {X.shape[1]}")
+        X = df.drop(
+            columns=[c for c in NON_FEATURE_COLS if c in df.columns],
+            errors="ignore"
+        )
 
-    X = X.replace([np.inf, -np.inf], np.nan)
-    nan_cols = X.columns[X.isna().any()]
-    if len(nan_cols):
-        print(f"Dropping {len(nan_cols)} NaN columns")
-        X = X.drop(columns=nan_cols)
+        X = sanitize(X)
 
-    X = variance_filter(X, VARIANCE_QUANTILE, plot=True)
-    print(f"After variance filter: {X.shape[1]}")
+        feats = prune_features(X, y, cfg)
+        results[name] = feats
+        all_sets.append(set(feats))
 
-    const_cols = X.columns[X.nunique() <= 1]
-    if len(const_cols):
-        X = X.drop(columns=const_cols)
+        print(f"{name}: {len(feats)} features")
 
-    print(f"After constant removal: {X.shape[1]}")
+    # shared core (≥2 targets)
+    from collections import Counter
+    counts = Counter(f for s in all_sets for f in s)
+    core = sorted([f for f, c in counts.items() if c >= 2])
 
-    selected = lgbm_prune(X, y)
-    print(f"Selected features: {len(selected)}")
+    results["core"] = core
 
-    os.makedirs(os.path.dirname(OUTPUT_FEATURES_JSON), exist_ok=True)
-    with open(OUTPUT_FEATURES_JSON, "w") as f:
-        json.dump(selected, f, indent=2)
+    os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
+    with open(OUTPUT_JSON, "w") as f:
+        json.dump(results, f, indent=2)
 
-    print(f"Saved to {OUTPUT_FEATURES_JSON}")
+    print(f"Saved feature sets to {OUTPUT_JSON}")
