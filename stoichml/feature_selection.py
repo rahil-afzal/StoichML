@@ -1,122 +1,158 @@
 """
 feature_selection.py
 --------------------
-Feature selection pipeline for StoichML.
+LightGBM-based feature pruning for StoichML.
 
-Steps:
-1. Drop non-feature columns (targets, identifiers, etc.)
-2. Sanitize data (replace inf/-inf, drop columns with NaNs)
-3. Variance filtering (drop low-variance features)
-4. Drop constant columns (optional)
-5. VIF filtering (drop multicollinear features)
-6. Save selected features to JSON
+Pipeline:
+1. Drop non-feature columns
+2. Sanitize data (inf/-inf)
+3. Variance filtering
+4. Drop constant columns
+5. LightGBM importance pruning (train-only)
+6. Save selected features
 """
 
 import os
 import json
+import numpy as np
 import pandas as pd
+import lightgbm as lgb
 import matplotlib.pyplot as plt
-from statsmodels.stats.outliers_influence import variance_inflation_factor
-from statsmodels.tools.tools import add_constant
+from sklearn.model_selection import train_test_split
+
 
 # -------------------------------
 # User parameters
 # -------------------------------
 INPUT_PATH = "data/data_feat.pkl"
 OUTPUT_FEATURES_JSON = "data/selected_features.json"
-VARIANCE_QUANTILE = 0.10  # Drop bottom 10% low-variance features
-VIF_THRESHOLD = 5.0       # Drop features with VIF > 5.0
 
-# Columns to drop (targets, identifiers, etc.)
+TARGET_COL = "enthalpy_formation_atom"   # change as needed
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+VARIANCE_QUANTILE = 0.10
+IMPORTANCE_CUTOFF = 0.80   # keep top 80% cumulative importance
+
 NON_FEATURE_COLS = [
-    'compound', 'spacegroup_relax', 'Egap', 'Egap_type',
-    'enthalpy_formation_atom', 'composition', 'elements',
-    'Egap_type_numeric', 'hm_class'
+    "compound",
+    "spacegroup_relax",
+    "Egap",
+    "Egap_type",
+    "Egap_type_numeric",
+    "composition",
+    "elements",
+    "hm_class",
 ]
 
+PHYSICS_FEATURES = {
+    "conf_entropy",
+    "chi_mad",
+    "chi_rng",
+    "r_mad",
+    "mass_std",
+    "val_mean",
+    "val_var",
+    "dhalf_mean",
+    "tm_frac",
+}
+
+
 # -------------------------------
-# Helper functions
+# Helpers
 # -------------------------------
-def variance_filter(X: pd.DataFrame, quantile: float = 0.10, plot: bool = True) -> pd.DataFrame:
-    """Removes features with variance below given quantile threshold."""
-    variances = X.var()
-    threshold = variances.quantile(quantile)
+def variance_filter(X, quantile=0.1, plot=True):
+    var = X.var()
+    thr = var.quantile(quantile)
+
     if plot:
-        plt.figure(figsize=(10, 6))
-        plt.hist(variances, bins=30, edgecolor='k', alpha=0.7)
-        plt.axvline(threshold, color='red', linestyle='--', label=f'Threshold = {threshold:.4f}')
-        plt.title('Histogram of Feature Variances')
-        plt.xlabel('Variance')
-        plt.ylabel('Number of Features')
-        plt.legend()
-        plt.grid(True)
+        plt.hist(var, bins=40)
+        plt.axvline(thr, color="r", linestyle="--")
+        plt.title("Feature variance distribution")
         plt.show()
-    return X.loc[:, variances > threshold]
 
-def calculate_vif(X: pd.DataFrame) -> pd.DataFrame:
-    """Computes VIF for all features."""
-    X_const = add_constant(X)
-    vif_data = pd.DataFrame({
-        "feature": X_const.columns,
-        "VIF": [variance_inflation_factor(X_const.values, i)
-                for i in range(X_const.shape[1])]
-    })
-    return vif_data[vif_data["feature"] != "const"]
+    return X.loc[:, var > thr]
 
-def drop_high_vif(X: pd.DataFrame, threshold: float = 5.0) -> pd.DataFrame:
-    """Drops features with VIF > threshold."""
-    X = X.copy()
-    while True:
-        vif_df = calculate_vif(X).sort_values(by="VIF", ascending=False)
-        if vif_df.empty or vif_df.iloc[0]['VIF'] <= threshold:
-            break
-        col = vif_df.iloc[0]['feature']
-        print(f"Dropping {col} due to high VIF ({vif_df.iloc[0]['VIF']:.2f})")
-        X = X.drop(columns=[col])
-    return X
+
+def lgbm_prune(X, y):
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X, y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE
+    )
+
+    model = lgb.LGBMRegressor(
+        n_estimators=600,
+        learning_rate=0.05,
+        max_depth=7,
+        num_leaves=31,
+        min_data_in_leaf=30,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_STATE,
+    )
+
+    model.fit(
+        X_tr, y_tr,
+        eval_set=[(X_val, y_val)],
+        eval_metric="rmse"
+    )
+
+    imp = pd.Series(
+        model.feature_importances_,
+        index=X.columns
+    ).sort_values(ascending=False)
+
+    imp_norm = imp / imp.sum()
+    keep = imp_norm.cumsum() <= IMPORTANCE_CUTOFF
+
+    selected = set(imp_norm[keep].index)
+
+    # Always keep physics features if they have nonzero importance
+    phys_keep = {
+        f for f in PHYSICS_FEATURES
+        if f in imp_norm.index and imp_norm[f] > 0
+    }
+
+    return sorted(selected | phys_keep)
+
 
 # -------------------------------
 # Main
 # -------------------------------
 if __name__ == "__main__":
-    if not os.path.exists(INPUT_PATH):
-        raise FileNotFoundError(f"Pickle file not found at {INPUT_PATH}")
 
     df = pd.read_pickle(INPUT_PATH)
 
-    # Drop non-feature columns
-    X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns], errors='ignore')
+    y = df[TARGET_COL]
+
+    X = df.drop(
+        columns=[c for c in NON_FEATURE_COLS + [TARGET_COL] if c in df.columns],
+        errors="ignore",
+    )
+
     print(f"Initial feature count: {X.shape[1]}")
 
-    # -------------------------------
-    # Sanitize data
-    # -------------------------------
-    X = X.replace([float('inf'), -float('inf')], pd.NA)
-    nan_cols = X.columns[X.isna().any()].tolist()
-    if nan_cols:
-        print(f"Dropping {len(nan_cols)} columns due to NaNs: {nan_cols}")
+    X = X.replace([np.inf, -np.inf], np.nan)
+    nan_cols = X.columns[X.isna().any()]
+    if len(nan_cols):
+        print(f"Dropping {len(nan_cols)} NaN columns")
         X = X.drop(columns=nan_cols)
-    print(f"Feature count after dropping NaNs/infs: {X.shape[1]}")
 
-    # Step 1: Variance filtering
-    X_var = variance_filter(X, quantile=VARIANCE_QUANTILE, plot=True)
-    print(f"After variance filtering: {X_var.shape[1]} features")
+    X = variance_filter(X, VARIANCE_QUANTILE, plot=True)
+    print(f"After variance filter: {X.shape[1]}")
 
-    # Step 1a: Drop constant columns
-    zero_var_cols = X_var.columns[X_var.nunique() <= 1].tolist()
-    if zero_var_cols:
-        print(f"Dropping {len(zero_var_cols)} constant columns: {zero_var_cols}")
-        X_var = X_var.drop(columns=zero_var_cols)
-    print(f"Feature count after dropping constant columns: {X_var.shape[1]}")
+    const_cols = X.columns[X.nunique() <= 1]
+    if len(const_cols):
+        X = X.drop(columns=const_cols)
 
-    # Step 2: VIF filtering
-    X_vif = drop_high_vif(X_var, threshold=VIF_THRESHOLD)
-    print(f"After VIF filtering: {X_vif.shape[1]} features")
+    print(f"After constant removal: {X.shape[1]}")
 
-    # Save selected features
-    selected_features = list(X_vif.columns)
+    selected = lgbm_prune(X, y)
+    print(f"Selected features: {len(selected)}")
+
     os.makedirs(os.path.dirname(OUTPUT_FEATURES_JSON), exist_ok=True)
     with open(OUTPUT_FEATURES_JSON, "w") as f:
-        json.dump(selected_features, f, indent=4)
+        json.dump(selected, f, indent=2)
 
-    print(f"Selected features saved to: {OUTPUT_FEATURES_JSON}")
+    print(f"Saved to {OUTPUT_FEATURES_JSON}")
