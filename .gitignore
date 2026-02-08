@@ -1,8 +1,14 @@
-data\data_feat.pkl
-stoichml\__pycache__\
-utils\__pycache__\
-data\selected_features.json
-data\.ipynb_checkpoints\
-data\test.ipynb
-models\
-shap_outputs\
+# Python
+__pycache__/
+
+# Data artifacts
+data/data_feat.pkl
+data/selected_features.json
+
+# Jupyter
+.ipynb_checkpoints/
+data/test.ipynb
+
+# Model outputs
+models/
+shap_outputs/

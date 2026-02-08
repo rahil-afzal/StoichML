@@ -60,7 +60,7 @@ TASKS = {
         "target": "hm_class",
         "type": "multiclass",
         "num_class": 3,
-        "class_weight": {0: 1, 1: 1, 2: 3},
+        "class_weight": {0: 1, 1: 1, 2: 8},
     },
 }
 
