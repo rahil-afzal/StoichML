@@ -4,6 +4,12 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import (
@@ -12,6 +18,8 @@ from sklearn.metrics import (
     r2_score,
     roc_auc_score,
     f1_score,
+    precision_recall_fscore_support,
+    confusion_matrix,
 )
 
 import lightgbm as lgb
@@ -27,7 +35,6 @@ OUT_DIR = "models"
 
 RANDOM_STATE = 42
 N_SPLITS = 5
-
 
 # =====================
 # TASK registry
@@ -57,7 +64,6 @@ TASKS = {
     },
 }
 
-
 # =====================
 # Helpers
 # =====================
@@ -82,23 +88,39 @@ def inverse_transform(y, mode):
     return y
 
 
-def regression_metrics(y, p):
+def regression_metrics(y_true, y_pred):
     return {
-        "rmse": float(np.sqrt(mean_squared_error(y, p))),
-        "mae": float(mean_absolute_error(y, p)),
-        "r2": float(r2_score(y, p)),
+        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+        "mae": float(mean_absolute_error(y_true, y_pred)),
+        "r2": float(r2_score(y_true, y_pred)),
     }
 
+
+def hm_metrics(y_true, y_pred, labels):
+    macro = f1_score(y_true, y_pred, average="macro")
+    weighted = f1_score(y_true, y_pred, average="weighted")
+
+    p, r, f, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        labels=labels,
+        zero_division=0,
+    )
+
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+
+    return {
+        "macro_f1": float(macro),
+        "weighted_f1": float(weighted),
+        "per_class_f1": {str(lbl): float(f[i]) for i, lbl in enumerate(labels)},
+        "confusion_matrix": cm.tolist(),
+    }
 
 # =====================
 # Training
 # =====================
 
 def train(task_name):
-
-    if task_name not in TASKS:
-        raise ValueError(f"Unknown task: {task_name}")
-
     cfg = TASKS[task_name]
     print(f"\n=== TASK: {task_name} ===")
 
@@ -109,36 +131,20 @@ def train(task_name):
     y_raw = df[cfg["target"]]
     y = transform_target(y_raw, cfg.get("transform"))
 
-    # CV splitter
     if cfg["type"] == "regression":
-        cv = KFold(
-            n_splits=N_SPLITS,
-            shuffle=True,
-            random_state=RANDOM_STATE,
-        )
+        cv = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
     else:
-        cv = StratifiedKFold(
-            n_splits=N_SPLITS,
-            shuffle=True,
-            random_state=RANDOM_STATE,
-        )
+        cv = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
 
-    fold_metrics = {
-        "lgbm": [],
-        "xgb": [],
-    }
+    fold_metrics = {"lgbm": [], "xgb": []}
 
-    # =====================
-    # Cross-validation
-    # =====================
+    for fold, (tr_idx, va_idx) in enumerate(cv.split(X, y)):
+        print(f"Fold {fold + 1}/{N_SPLITS}")
 
-    for fold, (tr, va) in enumerate(cv.split(X, y)):
-        print(f"Fold {fold+1}/{N_SPLITS}")
+        Xtr, Xva = X.iloc[tr_idx], X.iloc[va_idx]
+        ytr, yva = y.iloc[tr_idx], y.iloc[va_idx]
 
-        Xtr, Xva = X.iloc[tr], X.iloc[va]
-        ytr, yva = y.iloc[tr], y.iloc[va]
-
-        # ----- LightGBM -----
+        # ---------- LightGBM ----------
         if cfg["type"] == "regression":
             lgbm = lgb.LGBMRegressor(
                 learning_rate=0.05,
@@ -154,23 +160,22 @@ def train(task_name):
             lgbm = lgb.LGBMClassifier(
                 objective="binary" if cfg["type"] == "binary" else "multiclass",
                 num_class=cfg.get("num_class"),
+                class_weight=cfg.get("class_weight"),
                 learning_rate=0.05,
                 num_leaves=64,
                 min_data_in_leaf=50,
-                n_estimators=500,
                 feature_fraction=0.9,
                 bagging_fraction=0.8,
                 bagging_freq=1,
+                n_estimators=500,
                 random_state=RANDOM_STATE,
             )
 
-        fit_kw = {}
-        if "class_weight" in cfg:
-            fit_kw["class_weight"] = cfg["class_weight"]
+        lgbm.fit(Xtr, ytr)
 
-        lgbm.fit(Xtr, ytr, **fit_kw)
+        # ---------- XGBoost ----------
+        sample_weight = None
 
-        # ----- XGBoost -----
         if cfg["type"] == "regression":
             xgbm = xgb.XGBRegressor(
                 learning_rate=0.05,
@@ -194,99 +199,74 @@ def train(task_name):
                 tree_method="hist",
             )
 
-        if cfg["type"] == "binary" and cfg.get("class_weight") == "balanced":
-            pos = (ytr == 1).sum()
-            neg = (ytr == 0).sum()
-            xgbm.set_params(scale_pos_weight=neg / max(pos, 1))
+            if cfg["type"] == "binary" and cfg.get("class_weight") == "balanced":
+                pos = (ytr == 1).sum()
+                neg = (ytr == 0).sum()
+                xgbm.set_params(scale_pos_weight=neg / max(pos, 1))
 
-        xgbm.fit(Xtr, ytr, verbose=False)
+            elif cfg["type"] == "multiclass":
+                sample_weight = ytr.map(cfg["class_weight"]).values
 
-        # ----- Evaluation -----
+        xgbm.fit(Xtr, ytr, sample_weight=sample_weight, verbose=False)
+
+        # ---------- Evaluation ----------
         if cfg["type"] == "regression":
             yva_real = inverse_transform(yva, cfg.get("transform"))
-
-            p_l = inverse_transform(lgbm.predict(Xva), cfg.get("transform"))
-            p_x = inverse_transform(xgbm.predict(Xva), cfg.get("transform"))
-
-            fold_metrics["lgbm"].append(regression_metrics(yva_real, p_l))
-            fold_metrics["xgb"].append(regression_metrics(yva_real, p_x))
+            fold_metrics["lgbm"].append(
+                regression_metrics(yva_real, inverse_transform(lgbm.predict(Xva), cfg.get("transform")))
+            )
+            fold_metrics["xgb"].append(
+                regression_metrics(yva_real, inverse_transform(xgbm.predict(Xva), cfg.get("transform")))
+            )
 
         elif cfg["type"] == "binary":
-            p_l = lgbm.predict_proba(Xva)[:, 1]
-            p_x = xgbm.predict_proba(Xva)[:, 1]
-
             fold_metrics["lgbm"].append(
-                {"auc": float(roc_auc_score(yva, p_l))}
+                {"auc": float(roc_auc_score(yva, lgbm.predict_proba(Xva)[:, 1]))}
             )
             fold_metrics["xgb"].append(
-                {"auc": float(roc_auc_score(yva, p_x))}
+                {"auc": float(roc_auc_score(yva, xgbm.predict_proba(Xva)[:, 1]))}
             )
 
-        else:
-            p_l = lgbm.predict(Xva)
-            p_x = xgbm.predict(Xva)
-
+        else:  # hm_class
+            labels = list(range(cfg["num_class"]))
             fold_metrics["lgbm"].append(
-                {"macro_f1": float(f1_score(yva, p_l, average="macro"))}
+                hm_metrics(yva, lgbm.predict(Xva), labels)
             )
             fold_metrics["xgb"].append(
-                {"macro_f1": float(f1_score(yva, p_x, average="macro"))}
+                hm_metrics(yva, xgbm.predict(Xva), labels)
             )
 
-    # =====================
-    # Aggregate CV metrics
-    # =====================
+    # ---------- Aggregate ----------
+    def mean_metric(ms, key):
+        return float(np.mean([m[key] for m in ms]))
 
-    def average(metrics):
-        return {
-            k: float(np.mean([m[k] for m in metrics]))
-            for k in metrics[0]
+    if cfg["type"] == "multiclass":
+        cv_mean = {
+            "lgbm_macro_f1": mean_metric(fold_metrics["lgbm"], "macro_f1"),
+            "xgb_macro_f1": mean_metric(fold_metrics["xgb"], "macro_f1"),
+        }
+    else:
+        cv_mean = {
+            "lgbm": {k: mean_metric(fold_metrics["lgbm"], k) for k in fold_metrics["lgbm"][0]},
+            "xgb": {k: mean_metric(fold_metrics["xgb"], k) for k in fold_metrics["xgb"][0]},
         }
 
-    cv_mean = {
-        "lgbm": average(fold_metrics["lgbm"]),
-        "xgb": average(fold_metrics["xgb"]),
-    }
-
-    # =====================
-    # Final full-data fit
-    # =====================
-
-    final_lgbm = lgbm.__class__(**lgbm.get_params())
-    final_xgbm = xgbm.__class__(**xgbm.get_params())
-
-    final_lgbm.fit(X, y, **fit_kw)
-    final_xgbm.fit(X, y)
-
-    full_metrics = {}
-
-    if cfg["type"] == "regression":
-        y_real = inverse_transform(y, cfg.get("transform"))
-        p_l = inverse_transform(final_lgbm.predict(X), cfg.get("transform"))
-        p_x = inverse_transform(final_xgbm.predict(X), cfg.get("transform"))
-
-        full_metrics["lgbm"] = regression_metrics(y_real, p_l)
-        full_metrics["xgb"] = regression_metrics(y_real, p_x)
-
-    # =====================
-    # Save everything
-    # =====================
-
+    # ---------- Save ----------
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    joblib.dump(final_lgbm, f"{OUT_DIR}/{task_name}_lgbm.pkl")
-    joblib.dump(final_xgbm, f"{OUT_DIR}/{task_name}_xgb.pkl")
-
-    results = {
-        "cv_folds": fold_metrics,
-        "cv_mean": cv_mean,
-        "full_fit": full_metrics,
-    }
+    joblib.dump(lgbm, f"{OUT_DIR}/{task_name}_lgbm.pkl")
+    joblib.dump(xgbm, f"{OUT_DIR}/{task_name}_xgb.pkl")
 
     with open(f"{OUT_DIR}/{task_name}_metrics.json", "w") as f:
-        json.dump(results, f, indent=4)
+        json.dump(
+            {
+                "cv_folds": fold_metrics,
+                "cv_mean": cv_mean,
+            },
+            f,
+            indent=4,
+        )
 
-    print("\nSaved models and metrics.")
     print(json.dumps(cv_mean, indent=2))
 
 
@@ -298,5 +278,4 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", required=True, choices=TASKS.keys())
     args = parser.parse_args()
-
     train(args.task)

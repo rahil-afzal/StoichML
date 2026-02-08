@@ -6,3 +6,6 @@ xgboost
 lightgbm
 joblib
 lazypredict
+statsmodels
+shap
+matplotlib

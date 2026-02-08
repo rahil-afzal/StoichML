@@ -29,8 +29,6 @@ def load_and_featurize(
     if verbose:
         print(f"Featurization complete: {df_feat.shape[0]} rows, {df_feat.shape[1]} columns")
 
-    # Assign numeric Egap_type
-    df_feat['Egap_type_numeric'] = df_feat['Egap_type'].apply(lambda x: 0 if x == 'metal' else 1)
 
     # Assign half-metal classification
     def hm_class(egap_type):
