@@ -9,3 +9,4 @@ lazypredict
 statsmodels
 shap
 matplotlib
+jupyterlab

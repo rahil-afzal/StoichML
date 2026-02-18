@@ -57,7 +57,39 @@ def load_features(task: str) -> list:
     return list(dict.fromkeys(core + task_feats))
 
 
-def select_shap_values(raw_sv: np.ndarray, cfg: dict) -> np.ndarray:
+def select_shap_values(raw_sv, cfg):
+    """
+    Normalize SHAP output across regression, binary, and multiclass cases.
+    Always return array of shape (n_samples, n_features).
+    """
+    if cfg["type"] == "regression":
+        return raw_sv
+
+    if cfg["type"] == "binary":
+        # Sometimes list, sometimes 3D
+        if isinstance(raw_sv, list):
+            return raw_sv[1]
+        if raw_sv.ndim == 3:
+            return raw_sv[:, :, 1]
+        return raw_sv
+
+    if cfg["type"] == "multiclass":
+        class_id = cfg.get("shap_class", 0)
+
+        # Case 1: list[num_classes]
+        if isinstance(raw_sv, list):
+            return raw_sv[class_id]
+
+        # Case 2: (n_samples, n_features, num_classes)
+        if raw_sv.ndim == 3 and raw_sv.shape[2] == cfg["num_class"]:
+            return raw_sv[:, :, class_id]
+
+        # Case 3: (num_classes, n_samples, n_features)
+        if raw_sv.ndim == 3 and raw_sv.shape[0] == cfg["num_class"]:
+            return raw_sv[class_id]
+
+    raise RuntimeError(f"Unexpected SHAP output shape: {type(raw_sv)}")
+
     """Select SHAP values according to task type."""
     if cfg["type"] == "regression":
         return raw_sv

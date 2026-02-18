@@ -1,5 +1,6 @@
-# Python
+# Ignore all Python cache directories anywhere
 __pycache__/
+*.py[cod]
 
 # Data artifacts
 data/data_feat.pkl
