@@ -100,7 +100,7 @@ def hm_metrics(y_true, y_pred, labels):
     macro = f1_score(y_true, y_pred, average="macro")
     weighted = f1_score(y_true, y_pred, average="weighted")
 
-    p, r, f, _ = precision_recall_fscore_support(
+    _, _, f, _ = precision_recall_fscore_support(
         y_true,
         y_pred,
         labels=labels,
@@ -150,9 +150,6 @@ def train(task_name):
                 learning_rate=0.05,
                 num_leaves=64,
                 min_data_in_leaf=50,
-                feature_fraction=0.9,
-                bagging_fraction=0.8,
-                bagging_freq=1,
                 n_estimators=500,
                 random_state=RANDOM_STATE,
             )
@@ -164,9 +161,6 @@ def train(task_name):
                 learning_rate=0.05,
                 num_leaves=64,
                 min_data_in_leaf=50,
-                feature_fraction=0.9,
-                bagging_fraction=0.8,
-                bagging_freq=1,
                 n_estimators=500,
                 random_state=RANDOM_STATE,
             )
@@ -227,14 +221,10 @@ def train(task_name):
                 {"auc": float(roc_auc_score(yva, xgbm.predict_proba(Xva)[:, 1]))}
             )
 
-        else:  # hm_class
+        else:
             labels = list(range(cfg["num_class"]))
-            fold_metrics["lgbm"].append(
-                hm_metrics(yva, lgbm.predict(Xva), labels)
-            )
-            fold_metrics["xgb"].append(
-                hm_metrics(yva, xgbm.predict(Xva), labels)
-            )
+            fold_metrics["lgbm"].append(hm_metrics(yva, lgbm.predict(Xva), labels))
+            fold_metrics["xgb"].append(hm_metrics(yva, xgbm.predict(Xva), labels))
 
     # ---------- Aggregate ----------
     def mean_metric(ms, key):
@@ -251,13 +241,14 @@ def train(task_name):
             "xgb": {k: mean_metric(fold_metrics["xgb"], k) for k in fold_metrics["xgb"][0]},
         }
 
-    # ---------- Save ----------
-    os.makedirs(OUT_DIR, exist_ok=True)
+    # ---------- Save (TASK-SPECIFIC FOLDER) ----------
+    task_dir = os.path.join(OUT_DIR, task_name)
+    os.makedirs(task_dir, exist_ok=True)
 
-    joblib.dump(lgbm, f"{OUT_DIR}/{task_name}_lgbm.pkl")
-    joblib.dump(xgbm, f"{OUT_DIR}/{task_name}_xgb.pkl")
+    joblib.dump(lgbm, f"{task_dir}/{task_name}_lgbm.pkl")
+    joblib.dump(xgbm, f"{task_dir}/{task_name}_xgb.pkl")
 
-    with open(f"{OUT_DIR}/{task_name}_metrics.json", "w") as f:
+    with open(f"{task_dir}/{task_name}_metrics.json", "w") as f:
         json.dump(
             {
                 "cv_folds": fold_metrics,
@@ -276,6 +267,11 @@ def train(task_name):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task", required=True, choices=TASKS.keys())
+    parser.add_argument("--task", required=True, choices=list(TASKS.keys()) + ["all"])
     args = parser.parse_args()
-    train(args.task)
+
+    if args.task == "all":
+        for task in TASKS:
+            train(task)
+    else:
+        train(args.task)
