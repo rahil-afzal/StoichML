@@ -5,7 +5,7 @@ __pycache__/
 # Data artifacts
 data/data_feat.pkl
 data/selected_features.json
-
+egap_comparison
 # Jupyter
 .ipynb_checkpoints/
 data/test.ipynb
