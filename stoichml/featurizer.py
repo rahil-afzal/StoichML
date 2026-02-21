@@ -393,9 +393,17 @@ def stats(key, values, w):
 # Composition-level physics features
 # ══════════════════════════════════════════════════════════════════════════════
 
-def phys(elems, w):
+def phys(elems, w, raw_counts=None):
     """
     Compute composition-level physics-inspired features.
+
+    Args:
+        elems      : list of element symbols
+        w          : stoichiometric weights, normalised (sum = 1)
+        raw_counts : raw stoichiometric counts before normalisation,
+                     e.g. [2, 3] for Fe2O3. Required for n_atoms.
+                     If None, n_atoms falls back to w.sum() which is 1.0
+                     — so always pass raw_counts from featurize().
 
     All weighted statistics use valid-only entries with renormalised
     weights — no None-to-zero substitution anywhere.
@@ -404,6 +412,8 @@ def phys(elems, w):
       n_elements   number of distinct elements — strong structural prior;
                    binary and quinary compounds with the same weighted-mean
                    chi are physically very different materials.
+      n_atoms      total atom count per formula unit — formula unit size.
+                   Fe2O3 → 5. Assumes reduced formula (AFLOW/MP convention).
       max_weight   stoichiometric fraction of the majority element — captures
                    whether the composition is near-pure (max_weight → 1)
                    or well-mixed (max_weight → 1/n_elements).
@@ -481,8 +491,17 @@ def phys(elems, w):
 
     return {
         # ── Stoichiometric structure ──────────────────────────────────────
-        # Number of distinct elements — binary vs quinary is a strong prior
+        # Number of distinct species — chemical complexity prior.
+        # Fe2O3 → 2, regardless of formula unit size.
         "n_elements":    float(len(elems)),
+
+        # Total atom count per formula unit — formula unit size.
+        # Fe2O3 → 5, Fe4O6 → 10 (same compound, different conventions).
+        # Assumes input compositions are already in reduced form (as in
+        # AFLOW, MP, ICSD). Relevant for formation enthalpy (more bonds →
+        # larger |ΔHf|) and structural complexity priors.
+        # Uses raw_counts (before normalisation) — w.sum() is always 1.0.
+        "n_atoms":       float(raw_counts.sum()) if raw_counts is not None else float(len(elems)),
 
         # Majority element stoichiometric fraction
         # Near 1.0 → near-pure or dilute doping; near 1/n → equiatomic
@@ -558,12 +577,16 @@ def featurize(df, elements_col="elements", composition_col="composition"):
                    val, vac, dcount, dhalf, unpaired, EA, I1, Tm, Tb,
                    kappa, Ecoh, magmom
                  + 15 physics features:
-                   n_elements, max_weight, conf_entropy,
+                   n_elements, n_atoms, max_weight, conf_entropy,
                    chi_mad, delta_chi, r_mad, mass_std,
                    val_mean, val_var, dhalf_mean,
                    tm_frac, f_frac,
                    unpaired_mean, unpaired_var
-                 = 109 features total
+                 = 110 features total
+
+    NOTE: n_atoms is convention-dependent (Fe2O3=5, Fe4O6=10 for the same
+    compound). Ensure compositions are reduced to lowest integer ratios
+    before calling featurize() for this feature to be meaningful.
     """
     out = []
 
@@ -589,8 +612,11 @@ def featurize(df, elements_col="elements", composition_col="composition"):
             col_values = [d[k] for d in elem_dicts]
             feats.update(stats(k, col_values, w))
 
-        # Composition-level physics features  (14 features)
-        feats.update(phys(elems, w))
+        # Composition-level physics features  (15 features)
+        # Pass both normalised weights (w) and raw counts (comp) so phys()
+        # can compute n_atoms = comp.sum() correctly.
+        # w.sum() is always 1.0 after normalisation — not the atom count.
+        feats.update(phys(elems, w, comp))
 
         out.append(feats)
 

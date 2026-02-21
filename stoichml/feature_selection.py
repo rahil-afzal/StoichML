@@ -18,7 +18,7 @@ OUTPUT_JSON = "data/selected_features.json"
 
 RANDOM_STATE    = 42
 TEST_SIZE       = 0.2
-CUM_IMPORTANCE  = 0.85      # cumulative importance threshold for pruning
+CUM_IMPORTANCE  = 0.80      # cumulative importance threshold for pruning
 
 # Minimum normalised importance a physics feature must have to be force-retained.
 # 1/n_features is the "random chance" baseline — features below this carry
@@ -189,7 +189,7 @@ def prune_features(
     minimal feature set that explains CUM_IMPORTANCE of the total importance.
 
     Physics features are force-retained if their normalised importance
-    exceeds a minimum threshold (0.5× random-chance baseline). This prevents
+    exceeds a minimum threshold (0.5*random-chance baseline). This prevents
     junk retention (imp > 0 from a single split) while ensuring genuinely
     informative physics features are not pruned by the cumsum cutoff.
 
