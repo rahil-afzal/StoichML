@@ -335,7 +335,7 @@ def stats(key, values, w):
     valid entries. The miss fraction feature is omitted — property gaps
     are resolved by the patch table for all common elements.
 
-    Statistics returned (5 per property):
+    Statistics returned (7 per property):
       mean  weighted centroid
       std   weighted spread
       min   lightest/smallest extreme element value (unweighted — the extreme
@@ -347,6 +347,13 @@ def stats(key, values, w):
             the property range. Independent of mean/std/min/max individually.
             Answers: is the composition's centroid near its light or heavy
             end? E.g. pos(chi) near 1 → high-EN element dominates by weight.
+      hmean weighted harmonic mean — 1 / Σ(wᵢ/xᵢ). Physically motivated for
+            properties that combine in series (e.g. radius in close-packed
+            structures, conductivity). Only defined for strictly positive
+            values — returns 0.0 when any xᵢ ≤ 0.
+      gmean weighted geometric mean — exp(Σ wᵢ·log|xᵢ|). Appropriate for
+            multiplicative properties (e.g. ionisation energies, volumes).
+            Always defined for non-zero values via log|x|.
 
     NOTE: rng (= max - min) is intentionally excluded — it is fully
     determined by min and max and adds no information to the feature set.
@@ -359,12 +366,14 @@ def stats(key, values, w):
 
     if mask.sum() == 0:
         return {
-            f"{key}_mean": 0.0,
-            f"{key}_std":  0.0,
-            f"{key}_min":  0.0,
-            f"{key}_max":  0.0,
-            f"{key}_mad":  0.0,
-            f"{key}_pos":  0.5,   # neutral: mean at midpoint when all values absent
+            f"{key}_mean":  0.0,
+            f"{key}_std":   0.0,
+            f"{key}_min":   0.0,
+            f"{key}_max":   0.0,
+            f"{key}_mad":   0.0,
+            f"{key}_pos":   0.5,
+            f"{key}_hmean": 0.0,
+            f"{key}_gmean": 0.0,
         }
 
     xv = np.array([v for v in values[mask]], dtype=float)
@@ -379,13 +388,31 @@ def stats(key, values, w):
     rng  = vmax - vmin
     pos  = float((mean - vmin) / rng) if rng > 0 else 0.5
 
+    # Harmonic mean — only defined when all values are strictly positive.
+    # Returns 0.0 otherwise (e.g. properties that can be zero or negative
+    # like electron affinity, magnetic moment).
+    if np.all(xv > 0):
+        hmean = float(1.0 / np.sum(wv / xv))
+    else:
+        hmean = 0.0
+
+    # Geometric mean — defined for non-zero values via log|x|.
+    # Uses absolute value to handle signed properties (e.g. chi differences).
+    # Returns 0.0 if any value is exactly zero.
+    if np.all(xv != 0):
+        gmean = float(np.exp(np.sum(wv * np.log(np.abs(xv)))))
+    else:
+        gmean = 0.0
+
     return {
-        f"{key}_mean": mean,
-        f"{key}_std":  std,
-        f"{key}_min":  vmin,
-        f"{key}_max":  vmax,
-        f"{key}_mad":  mad,
-        f"{key}_pos":  pos,
+        f"{key}_mean":  mean,
+        f"{key}_std":   std,
+        f"{key}_min":   vmin,
+        f"{key}_max":   vmax,
+        f"{key}_mad":   mad,
+        f"{key}_pos":   pos,
+        f"{key}_hmean": hmean,
+        f"{key}_gmean": gmean,
     }
 
 
@@ -427,10 +454,12 @@ def phys(elems, w, raw_counts=None):
     radii, r_mask    = [], []
     masses, m_mask   = [], []
     vals, dhalf_arr, unpaired_arr = [], [], []
+    orb_counts_list  = []   # per-element valence electron counts by orbital type
 
     for sym in elems:
         v_dict = vec(sym)                       # patched values for chi/radius/mass
-        _, _, _, dh, up = valence_props(elem(sym))
+        e_obj  = elem(sym)
+        _, _, _, dh, up = valence_props(e_obj)
 
         chi  = v_dict["chi"]
         rad  = v_dict["radius"]
@@ -443,6 +472,35 @@ def phys(elems, w, raw_counts=None):
         vals.append(v)
         dhalf_arr.append(dh)
         unpaired_arr.append(up)
+
+        # ── Orbital electron counts for S_orb ────────────────────────────
+        # Count valence electrons by orbital type (s/p/d/f) using the same
+        # shell logic as valence_props(). Stored per element; aggregated
+        # stoichiometrically after the loop.
+        conf  = e_obj.econf or ""
+        parts = re.findall(r'(\d+)([spdf])(\d+)', conf)
+        shells = [(int(n), o, int(k)) for n, o, k in parts]
+        block  = e_obj.block
+        oc     = {"s": 0, "p": 0, "d": 0, "f": 0}
+
+        if shells:
+            nmax = max(n for n, _, _ in shells)
+            for n, o, k in shells:
+                if block in ("s", "p"):
+                    if n == nmax:
+                        oc[o] += k
+                elif block == "d":
+                    if (n == nmax and o == "s") or (n == nmax - 1 and o == "d"):
+                        oc[o] += k
+                elif block == "f":
+                    if (
+                        (n == nmax     and o == "s")
+                        or (n == nmax - 1 and o == "d")
+                        or (n == nmax - 2 and o == "f")
+                    ):
+                        oc[o] += k
+
+        orb_counts_list.append(oc)
 
     vals         = np.array(vals,         dtype=float)
     dhalf_arr    = np.array(dhalf_arr,    dtype=float)
@@ -489,6 +547,40 @@ def phys(elems, w, raw_counts=None):
     val_mean = float(np.sum(w_norm * vals))
     up_mean  = float(np.sum(w_norm * unpaired_arr))
 
+    # ── Magnetic entropy ──────────────────────────────────────────────────
+    # S_mag = Σᵢ wᵢ · ln(2Sᵢ + 1)   where Sᵢ = unpaired_i / 2
+    #
+    # Measures the degeneracy of spin microstates per atom.
+    # For Mn (d⁵, S=5/2): ln(6) ≈ 1.79.  For O (non-magnetic, S=0): ln(1) = 0.
+    # Distinct from unpaired_mean (linear spin count) — S_mag captures the
+    # logarithmic statistical weight, which is the thermodynamic driver for
+    # magnetic ordering. Directly relevant to hm_class.
+    spin_arr = unpaired_arr / 2.0
+    S_mag    = float(np.sum(w_norm * np.log(2.0 * spin_arr + 1.0)))
+
+    # ── Orbital entropy ───────────────────────────────────────────────────
+    # S_orb = -Σₒ pₒ · log(pₒ)   over orbital types o ∈ {s, p, d, f}
+    #
+    # pₒ = (Σᵢ wᵢ · nᵢₒ) / (Σₒ Σᵢ wᵢ · nᵢₒ)
+    # where nᵢₒ is the number of valence electrons of type o for element i.
+    #
+    # Measures how mixed the orbital character of the compound is.
+    # Pure sp compound (NaCl): low S_orb.
+    # Mixed spd compound (perovskite): higher S_orb.
+    # Relevant for egap and egap_type — orbital mixing determines
+    # whether bands hybridise to open or close a gap.
+    total_orb = {o: 0.0 for o in "spdf"}
+    for i, oc in enumerate(orb_counts_list):
+        for o in "spdf":
+            total_orb[o] += w_norm[i] * oc[o]
+    total_elec = sum(total_orb.values())
+    if total_elec > 0:
+        p_orb = np.array([total_orb[o] / total_elec for o in "spdf"])
+        p_orb = p_orb[p_orb > 0]            # drop zero terms (log(0) undefined)
+        S_orb = float(-np.sum(p_orb * np.log(p_orb)))
+    else:
+        S_orb = 0.0
+
     return {
         # ── Stoichiometric structure ──────────────────────────────────────
         # Number of distinct species — chemical complexity prior.
@@ -512,6 +604,18 @@ def phys(elems, w, raw_counts=None):
         # full distribution shape for multicomponent compositions
         "conf_entropy":  float(-np.sum(w_norm * np.log(w_norm + 1e-12))),
 
+        # ── Magnetic entropy ──────────────────────────────────────────────
+        # S_mag = Σᵢ wᵢ · ln(2Sᵢ + 1).
+        # Logarithmic spin degeneracy — thermodynamic driver for magnetic
+        # ordering. Distinct from unpaired_mean (linear spin count).
+        "S_mag":         S_mag,
+
+        # ── Orbital entropy ───────────────────────────────────────────────
+        # S_orb = -Σₒ pₒ · log(pₒ) over s/p/d/f valence electron fractions.
+        # Low → pure sp or pure d character. High → mixed spd/spdf.
+        # Captures orbital hybridisation potential relevant to band gap.
+        "S_orb":         S_orb,
+
         # ── Electronegativity mismatch → bond ionicity proxy ──────────────
         # delta_chi: raw span from most electropositive to most electronegative
         # element in the compound — directly analogous to Phillips ionicity
@@ -521,6 +625,29 @@ def phys(elems, w, raw_counts=None):
         # delta_chi by capturing how spread out the distribution is.
         "chi_mad":       _wmad(chis,   chi_mask, chi_mean),
         "delta_chi":     _wrng(chis,   chi_mask),
+
+        # ── Pairwise electronegativity interaction (Miedema-style) ────────
+        # pair_chi = Σᵢ<ⱼ  wᵢ · wⱼ · (χᵢ − χⱼ)²
+        #
+        # For ABX3 with w = [1/5, 1/5, 3/5]:
+        #   A–B: (1/5)(1/5)(χ_A−χ_B)²
+        #   A–X: (1/5)(3/5)(χ_A−χ_X)²
+        #   B–X: (1/5)(3/5)(χ_B−χ_X)²
+        #
+        # Distinct from delta_chi (span only) and chi_mad (deviation from
+        # mean): pair_chi weights each specific bond by how frequently those
+        # two atom types are neighbours (∝ wᵢ·wⱼ in a random solid solution).
+        # Grounded in Miedema's model where ΔH_mix ∝ (Δφ*)² with φ* ≈ χ.
+        # Missing chi values fall back to chi_mean (neutral imputation).
+        "pair_chi":      float(sum(
+                             w_norm[i] * w_norm[j] *
+                             (
+                                 (chis[i] if chis[i] is not None else chi_mean) -
+                                 (chis[j] if chis[j] is not None else chi_mean)
+                             ) ** 2
+                             for i in range(len(elems))
+                             for j in range(i + 1, len(elems))
+                         )),
 
         # ── Atomic size mismatch → lattice strain proxy ───────────────────
         "r_mad":         _wmad(radii,  r_mask, r_mean),
@@ -571,18 +698,19 @@ def featurize(df, elements_col="elements", composition_col="composition"):
       composition_col list of stoichiometric counts, e.g. [1, 2]  (FeO2)
 
     Returns the original DataFrame concatenated with all feature columns.
-    Feature count: 19 properties x 5 stats = 95 elemental features
-                   (mean, std, min, max, mad, pos — rng removed as redundant)
+    Feature count: 19 properties x 7 stats = 133 elemental features
+                   (mean, std, min, max, mad, pos, hmean, gmean)
                    Properties: Z, mass, chi, radius, volume, polar, hard,
                    val, vac, dcount, dhalf, unpaired, EA, I1, Tm, Tb,
                    kappa, Ecoh, magmom
-                 + 15 physics features:
-                   n_elements, n_atoms, max_weight, conf_entropy,
-                   chi_mad, delta_chi, r_mad, mass_std,
+                 + 18 physics features:
+                   n_elements, n_atoms, max_weight,
+                   conf_entropy, S_mag, S_orb,
+                   chi_mad, delta_chi, pair_chi, r_mad, mass_std,
                    val_mean, val_var, dhalf_mean,
                    tm_frac, f_frac,
                    unpaired_mean, unpaired_var
-                 = 110 features total
+                 = 151 features total
 
     NOTE: n_atoms is convention-dependent (Fe2O3=5, Fe4O6=10 for the same
     compound). Ensure compositions are reduced to lowest integer ratios

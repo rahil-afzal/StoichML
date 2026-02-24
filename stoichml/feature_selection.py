@@ -5,9 +5,8 @@ import json
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
-from collections import Counter
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
@@ -16,18 +15,13 @@ from collections import Counter
 INPUT_PATH  = "data/data_feat.pkl"
 OUTPUT_JSON = "data/selected_features.json"
 
-RANDOM_STATE    = 42
-TEST_SIZE       = 0.2
-CUM_IMPORTANCE  = 0.80      # cumulative importance threshold for pruning
+RANDOM_STATE   = 42
+N_FOLDS        = 5       # CV folds for importance averaging
+CUM_IMPORTANCE = 0.85    # cumulative importance threshold
 
-# Minimum normalised importance a physics feature must have to be force-retained.
-# 1/n_features is the "random chance" baseline — features below this carry
-# less signal than a random column and should not be force-retained.
-# Set dynamically in prune_features() based on actual feature count.
-PHYSICS_MIN_IMP_FACTOR = 0.5   # must be > 0.5× random-chance importance
-
-# A feature is included in "core" if it is selected for at least this many tasks
-CORE_MIN_TASKS = 2
+# Must match the seeds used in train_egap_type_ensemble.py
+# so that pruning and training see the same balanced distributions.
+UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
 
 TARGETS = {
     "enthalpy": {
@@ -40,8 +34,9 @@ TARGETS = {
         "log":  True,
     },
     "egap_type": {
-        "col":  "Egap_type_numeric",
-        "task": "binary",
+        "col":             "Egap_type_numeric",
+        "task":            "binary",
+        "use_undersample": True,    # importance averaged over undersampled folds
     },
     "hm_class": {
         "col":  "hm_class",
@@ -61,64 +56,48 @@ NON_FEATURE_COLS = [
     "hm_class",
 ]
 
-# ── Physics features, grouped by task relevance ───────────────────────────────
-# Splitting by task prevents task-irrelevant physics features from being
-# force-retained where they are genuinely noise.
+# ── Physics features — force-retained for ALL tasks ───────────────────────────
+# Every feature in this set is kept regardless of its importance score.
+# Domain knowledge takes precedence over data-driven pruning for features
+# with explicit physical justification.
 #
-# GLOBAL: relevant for all tasks — stoichiometric structure and bond character
-# are universal priors regardless of target property.
-#
-# ENTHALPY: thermochemical features — cohesive energy and atomic size/mass
-# mismatch encode the energetic cost of forming the compound from elements.
-#
-# EGAP / EGAP_TYPE: electronic structure features — electronegativity spread
-# (delta_chi) is the primary driver of band gap via Phillips ionicity theory.
-# Valence electron count controls whether the gap is zero (metal) or nonzero.
-#
-# HM_CLASS: magnetic features — magmom, unpaired, f_frac are the primary
-# signals for half-metal and spintronic classification. Forcing these into
-# enthalpy or egap models adds noise.
+# Elemental stat features (e.g. magmom_mean, Ecoh_mean, chi_hmean) flow
+# through the cumsum cutoff normally — only composition-level physics
+# features computed in phys() are listed here.
 
 PHYSICS_FEATURES = {
-    # shared across all tasks
-    "global": {
-        "n_elements",       # number of distinct species — structural prior
-        "max_weight",       # stoichiometric dominance of majority element
-        "conf_entropy",     # mixing entropy — equiatomic vs. doped
-        "chi_mad",          # weighted EN mismatch — bond ionicity
-        "delta_chi",        # max EN span — Phillips ionicity proxy (renamed from chi_rng)
-        "r_mad",            # atomic size mismatch — lattice strain
-        "val_mean",         # average valence electron count
-        "val_var",          # valence electron dispersion
-    },
-    "enthalpy": {
-        "mass_std",         # mass dispersion — correlates with zero-point energy
-        "dhalf_mean",       # d-shell half-filling — stability via exchange
-    },
-    "egap": {
-        "dhalf_mean",       # d-shell character → metallic vs. insulating
-        "tm_frac",          # transition metal fraction → band gap suppression
-        "f_frac",           # f-block fraction → heavy-fermion / correlated electron
-    },
-    "egap_type": {
-        "dhalf_mean",
-        "tm_frac",
-        "f_frac",
-        "val_mean",         # already in global but explicit here for clarity
-    },
-    "hm_class": {
-        "unpaired_mean",    # Hund's rule free-atom spin proxy
-        "unpaired_var",     # spin dispersion — uniform vs. concentrated moment
-        "tm_frac",          # d-block fraction — primary half-metal driver
-        "f_frac",           # rare-earth fraction — high-moment magnets
-        "dhalf_mean",       # half-filled d-shell → Hund's maximum
-        "mass_std",         # heavy elements → stronger SOC
-    },
-}
+    # ── Stoichiometric structure ──────────────────────────────────────────
+    "n_elements",       # number of distinct species
+    "n_atoms",          # total atoms per formula unit (assumes reduced form)
+    "max_weight",       # stoichiometric fraction of majority element
 
-def physics_for_task(task_name: str) -> set:
-    """Return the union of global + task-specific physics features."""
-    return PHYSICS_FEATURES["global"] | PHYSICS_FEATURES.get(task_name, set())
+    # ── Entropy features ──────────────────────────────────────────────────
+    "conf_entropy",     # configurational mixing entropy -Σ wᵢ·log(wᵢ)
+    "S_mag",            # magnetic entropy Σ wᵢ·ln(2Sᵢ+1) — spin degeneracy
+    "S_orb",            # orbital entropy over s/p/d/f fractions
+
+    # ── Electronegativity mismatch ────────────────────────────────────────
+    "chi_mad",          # weighted EN mismatch
+    "delta_chi",        # EN span max−min — Phillips ionicity proxy
+    "pair_chi",         # Miedema pairwise Σ wᵢwⱼ(χᵢ−χⱼ)²
+
+    # ── Structural mismatch ───────────────────────────────────────────────
+    "r_mad",            # atomic size mismatch — lattice strain proxy
+    "mass_std",         # mass dispersion
+
+    # ── Valence electron structure ────────────────────────────────────────
+    "val_mean",         # weighted mean valence electron count
+    "val_var",          # valence electron dispersion
+
+    # ── d/f shell character ───────────────────────────────────────────────
+    "dhalf_mean",       # mean d-shell half-filling distance |dcnt − 5|
+    "tm_frac",          # d-block (transition metal) stoichiometric fraction
+    "f_frac",           # f-block (lanthanide/actinide) fraction
+
+    # ── Magnetic features ─────────────────────────────────────────────────
+    "unpaired_mean",    # Hund's rule free-atom spin proxy
+    "unpaired_var",     # spin dispersion across constituent elements
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -126,12 +105,47 @@ def physics_for_task(task_name: str) -> set:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def sanitize(X: pd.DataFrame) -> pd.DataFrame:
-    """Drop inf values and columns with any NaN."""
+    """
+    Replace inf values with NaN, then impute column medians.
+    Median imputation is used here for feature selection only —
+    the training pipeline handles imputation independently.
+    """
     X = X.replace([np.inf, -np.inf], np.nan)
-    return X.dropna(axis=1)
+    X = X.fillna(X.median(numeric_only=True))
+    return X
 
 
-def lgbm_model(task: str, y: pd.Series):
+def undersample_majority(
+    X: pd.DataFrame,
+    y: pd.Series,
+    seed: int,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """
+    Randomly undersample the majority class (class 0) to match the
+    minority class (class 1) size. Minority class always kept whole.
+    Must be identical to the implementation in train_egap_type_ensemble.py.
+    """
+    idx_minority = y[y == 1].index
+    idx_majority = y[y == 0].index
+
+    rng = np.random.default_rng(seed)
+    idx_majority_sampled = rng.choice(
+        idx_majority, size=len(idx_minority), replace=False
+    )
+
+    idx_balanced = np.concatenate([idx_minority, idx_majority_sampled])
+    rng.shuffle(idx_balanced)
+
+    return X.loc[idx_balanced], y.loc[idx_balanced]
+
+
+def lgbm_model(task: str, y: pd.Series) -> lgb.LGBMClassifier | lgb.LGBMRegressor:
+    """
+    Build a LightGBM model for the given task type.
+    importance_type='gain' — correctly weights sparse physics features.
+    No class_weight for egap_type binary — training data is already
+    balanced by undersampling, so weighting would double-correct.
+    """
     if task == "regression":
         return lgb.LGBMRegressor(
             n_estimators=700,
@@ -141,16 +155,18 @@ def lgbm_model(task: str, y: pd.Series):
             min_data_in_leaf=30,
             subsample=0.8,
             colsample_bytree=0.8,
+            importance_type="gain",
             random_state=RANDOM_STATE,
         )
 
     if task == "binary":
+        # No class_weight — used on already-balanced undersampled data
         return lgb.LGBMClassifier(
             n_estimators=600,
             learning_rate=0.05,
             max_depth=7,
             num_leaves=31,
-            class_weight="balanced",
+            importance_type="gain",
             random_state=RANDOM_STATE,
         )
 
@@ -162,9 +178,6 @@ def lgbm_model(task: str, y: pd.Series):
             y=y,
         )
         class_weight = dict(zip(classes.tolist(), weights.tolist()))
-
-        # Amplify rare class (half-metal, class 2) — minority oversampling
-        # proxy at the loss level. Factor of 2× on top of balanced weights.
         if 2 in class_weight:
             class_weight[2] *= 2.0
 
@@ -174,8 +187,95 @@ def lgbm_model(task: str, y: pd.Series):
             max_depth=7,
             num_leaves=31,
             class_weight=class_weight,
+            importance_type="gain",
             random_state=RANDOM_STATE,
         )
+
+
+def average_importances(
+    X: pd.DataFrame,
+    y: pd.Series,
+    cfg: dict,
+) -> pd.Series:
+    """
+    Compute CV-averaged gain importances for standard tasks (regression
+    and multiclass). Uses N_FOLDS stratified folds.
+    """
+    task = cfg["task"]
+    cv   = (
+        KFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+        if task == "regression"
+        else StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    )
+
+    fold_imps = []
+
+    for fold, (tr_idx, _) in enumerate(cv.split(X, y), 1):
+        X_tr, y_tr = X.iloc[tr_idx], y.iloc[tr_idx]
+
+        model = lgbm_model(task, y_tr)
+        model.fit(X_tr, y_tr)
+
+        imp = pd.Series(model.feature_importances_, index=X.columns)
+        imp = imp / imp.sum()
+        fold_imps.append(imp)
+
+        print(f"    fold {fold}/{N_FOLDS} done")
+
+    return pd.concat(fold_imps, axis=1).mean(axis=1).sort_values(ascending=False)
+
+
+def average_importances_undersampled(
+    X: pd.DataFrame,
+    y: pd.Series,
+) -> pd.Series:
+    """
+    Compute importance scores for egap_type using the same undersampled
+    training distributions used in train_egap_type_ensemble.py.
+
+    For each of N_FOLDS × N_SEEDS combinations:
+      - Split into train/val using StratifiedKFold on the FULL dataset
+        (so the val fold always reflects the true 5:1 distribution)
+      - Undersample only the training fold with each seed
+      - Train LightGBM on the balanced training fold
+      - Record feature importances
+
+    Average across all N_FOLDS × N_SEEDS runs.
+
+    This ensures features are selected based on what's actually
+    informative for the balanced training regime, not the imbalanced
+    full dataset where the majority class dominates importance scores.
+    """
+    cv = StratifiedKFold(
+        n_splits=N_FOLDS, shuffle=True, random_state=RANDOM_STATE
+    )
+
+    all_imps = []
+    n_total  = N_FOLDS * len(UNDERSAMPLE_SEEDS)
+    run      = 0
+
+    for fold, (tr_idx, _) in enumerate(cv.split(X, y), 1):
+        X_tr_full = X.iloc[tr_idx]
+        y_tr_full = y.iloc[tr_idx]
+
+        for seed in UNDERSAMPLE_SEEDS:
+            run += 1
+            # Undersample only the training fold — val fold never touched
+            X_tr_bal, y_tr_bal = undersample_majority(X_tr_full, y_tr_full, seed)
+
+            model = lgbm_model("binary", y_tr_bal)
+            model.fit(X_tr_bal, y_tr_bal)
+
+            imp = pd.Series(model.feature_importances_, index=X.columns)
+            imp = imp / imp.sum()
+            all_imps.append(imp)
+
+            print(f"    fold {fold}/{N_FOLDS}  seed {seed:3d}  "
+                  f"[{run}/{n_total}]  "
+                  f"train size: {len(y_tr_bal)} "
+                  f"({(y_tr_bal==0).sum()} / {(y_tr_bal==1).sum()})")
+
+    return pd.concat(all_imps, axis=1).mean(axis=1).sort_values(ascending=False)
 
 
 def prune_features(
@@ -185,64 +285,45 @@ def prune_features(
     task_name: str,
 ) -> list[str]:
     """
-    Train a LightGBM model, extract feature importances, and return the
-    minimal feature set that explains CUM_IMPORTANCE of the total importance.
+    Select features for a single task.
 
-    Physics features are force-retained if their normalised importance
-    exceeds a minimum threshold (0.5*random-chance baseline). This prevents
-    junk retention (imp > 0 from a single split) while ensuring genuinely
-    informative physics features are not pruned by the cumsum cutoff.
+    For egap_type: importances are averaged over N_FOLDS × N_SEEDS
+    undersampled training runs, matching the actual training strategy.
 
-    FIX from original: cumsum <= threshold excludes the feature that first
-    pushes cumsum over the line. Changed to < threshold so the boundary
-    feature is included — otherwise the actual retained importance is
-    systematically below the target.
+    For all other tasks: standard N_FOLDS CV importance averaging.
+
+    In both cases: all PHYSICS_FEATURES are force-retained regardless
+    of importance score.
     """
     if cfg.get("log", False):
         y = np.log1p(y.clip(lower=0))
 
-    X_tr, X_val, y_tr, y_val = train_test_split(
-        X, y,
-        test_size=TEST_SIZE,
-        random_state=RANDOM_STATE,
-        stratify=y if cfg["task"] != "regression" else None,
-    )
+    if cfg.get("use_undersample", False):
+        print(f"  [{task_name}] Using undersampled importance averaging "
+              f"({N_FOLDS} folds × {len(UNDERSAMPLE_SEEDS)} seeds "
+              f"= {N_FOLDS * len(UNDERSAMPLE_SEEDS)} runs)")
+        imp = average_importances_undersampled(X, y)
+    else:
+        imp = average_importances(X, y, cfg)
 
-    model = lgbm_model(cfg["task"], y_tr)
-    model.fit(X_tr, y_tr)
-
-    imp = pd.Series(
-        model.feature_importances_,
-        index=X.columns,
-    ).sort_values(ascending=False)
-
-    imp_norm = imp / imp.sum()
-    cumsum = imp_norm.cumsum()
+    # Shifted cumsum — boundary feature is included, not excluded
+    cumsum    = imp.cumsum()
     keep_mask = cumsum.shift(1, fill_value=0.0) < CUM_IMPORTANCE
-    selected = set(imp_norm[keep_mask].index)
+    selected  = set(imp[keep_mask].index)
 
-    # Physics feature retention with signal threshold.
-    # Random-chance importance baseline = 1 / n_features.
-    # Require physics features to clear 0.5× that baseline to be retained.
-    # This excludes features that appear in the model from random splits only.
-    random_baseline = 1.0 / len(X.columns)
-    min_imp = PHYSICS_MIN_IMP_FACTOR * random_baseline
+    # Force-retain all physics features
+    available = {f for f in PHYSICS_FEATURES if f in imp.index}
+    missing   = {f for f in PHYSICS_FEATURES if f not in imp.index}
+    forced_in = available - selected
 
-    task_physics = physics_for_task(task_name)
-    retained_physics = {
-        f for f in task_physics
-        if f in imp_norm.index and imp_norm[f] >= min_imp
-    }
-    dropped_physics = {
-        f for f in task_physics
-        if f in imp_norm.index and imp_norm[f] < min_imp
-    }
+    if forced_in:
+        print(f"  [{task_name}] Force-retained (below cumsum cutoff): "
+              f"{sorted(forced_in)}")
+    if missing:
+        print(f"  [{task_name}] Not found in X (check featurizer): "
+              f"{sorted(missing)}")
 
-    if dropped_physics:
-        print(f"  [{task_name}] Physics features below signal threshold "
-              f"(dropped): {sorted(dropped_physics)}")
-
-    selected |= retained_physics
+    selected |= available
 
     return sorted(selected)
 
@@ -255,11 +336,12 @@ if __name__ == "__main__":
 
     df = pd.read_pickle(INPUT_PATH)
 
-    results   = {}
-    all_sets  = []
+    results = {}
 
     for name, cfg in TARGETS.items():
-        print(f"\n── {name} ──────────────────────────────────────────────")
+        print(f"\n{'═' * 55}")
+        print(f"  Task: {name}")
+        print(f"{'═' * 55}")
 
         y = df[cfg["col"]]
         X = df.drop(
@@ -270,27 +352,12 @@ if __name__ == "__main__":
 
         feats = prune_features(X, y, cfg, task_name=name)
         results[name] = feats
-        all_sets.append(set(feats))
 
-        print(f"  Selected: {len(feats)} features")
-
-    # ── Core feature set: selected for at least CORE_MIN_TASKS tasks ─────
-    counts = Counter(f for s in all_sets for f in s)
-    core   = sorted(f for f, c in counts.items() if c >= CORE_MIN_TASKS)
-    results["core"] = core
-
-    print(f"\n── Core (≥{CORE_MIN_TASKS} tasks): {len(core)} features ──────")
-
-    # ── Feature overlap summary ───────────────────────────────────────────
-    print("\n── Per-task feature counts ──────────────────────────────────")
-    for name in TARGETS:
-        exclusive = set(results[name]) - set(core)
-        print(f"  {name:12s}: {len(results[name]):3d} total  "
-              f"| {len(exclusive):3d} task-exclusive")
+        print(f"  → Selected: {len(feats)} features")
 
     # ── Save ──────────────────────────────────────────────────────────────
     os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
     with open(OUTPUT_JSON, "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"\nSaved feature sets → {OUTPUT_JSON}")
+    print(f"\nSaved → {OUTPUT_JSON}")

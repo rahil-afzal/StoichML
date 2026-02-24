@@ -191,8 +191,12 @@ def lgbm_regression(n_estimators: int = 5000) -> lgb.LGBMRegressor:
 
 
 def lgbm_binary() -> lgb.LGBMClassifier:
+    # num_class must NOT be set (or must be 1) for binary tasks.
+    # LightGBM raises "[Fatal] Number of classes must be 1 for
+    # non-multiclass training" if num_class > 1 is passed here.
     return lgb.LGBMClassifier(
         objective="binary",
+        num_class=1,            # explicit — prevents accidental leakage
         class_weight="balanced",
         learning_rate=0.05,
         num_leaves=64,
@@ -283,9 +287,15 @@ def train(task_name: str):
     y_raw = df[cfg["target"]]
     y     = transform_target(y_raw, cfg.get("transform"))
 
-    task_type  = cfg["type"]
-    n_classes  = cfg.get("num_class", 2)
+    task_type    = cfg["type"]
     class_weight = cfg.get("class_weight", {})
+
+    # n_classes is only meaningful for multiclass tasks.
+    # For binary, LightGBM requires num_class=1 (or unset).
+    # Defaulting to 2 here caused "Number of classes must be 1
+    # for non-multiclass training" because the value leaked through
+    # cfg.get("num_class", 2) for tasks that have no num_class key.
+    n_classes = cfg["num_class"] if task_type == "multiclass" else 1
 
     cv = (
         KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
