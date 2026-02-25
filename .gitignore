@@ -13,8 +13,4 @@ data/test.ipynb
 # Model outputs
 models/
 shap_outputs/
-data/data_feat.pkl
-data/data_feat.pkl
-data/dataset.pkl
-stoichml/__pycache__/featurizer.cpython-313.pyc
-data/selected_features.json
+
