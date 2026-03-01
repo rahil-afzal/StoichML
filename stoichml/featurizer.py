@@ -18,6 +18,19 @@ Design decisions:
   - unpaired electrons estimated via Hund's rule as a magnetic moment proxy.
   - dcnt restricted to valence d-shell (n == nmax-1) only — prevents
     overcounting for 4d/5d elements with filled 3d cores.
+
+New properties vs. previous version:
+  - wf      Work function [eV] — energy to remove an electron from the solid
+            surface. Directly related to band alignment and gap magnitude.
+            Wide-gap insulators (oxides, fluorides) have systematically higher
+            work functions than narrow-gap semiconductors.
+  - pcount  Valence p-electron count — sp-gaps are dominated by p-p orbital
+            interactions. Complements dcount (d-electrons) which was already
+            present. Extracted alongside dcount in valence_props().
+  - period  Period number — captures relativistic effects in 5d/6p elements
+            (s-orbital contraction, d-orbital expansion) that directly affect
+            band gaps. Also cleanly separates 2p wide-gap insulators (MgO)
+            from 3d narrow-gap semiconductors with identical val counts.
 """
 
 import re
@@ -30,38 +43,7 @@ from functools import lru_cache
 # ══════════════════════════════════════════════════════════════════════════════
 # Literature patch table
 # ══════════════════════════════════════════════════════════════════════════════
-# Strategy:
-#   EA = 0.0  for elements whose anions are thermodynamically unstable.
-#             Convention used universally in descriptor databases (MAGPIE etc.)
-#             when experimental EA < 0.  Source: Andersen (2004) Phys. Rep. 394.
-#             Once EA is patched, hard = (I1 - EA)/2 is computable directly.
-#
-#   kappa     from CRC Handbook of Chemistry & Physics, 95th Ed. (Haynes 2014).
-#
-#   Tm / Tb   for allotropic elements (P, S, Se, Sn): stable phase at STP.
-#             Carbon deliberately excluded — sublimates at 1 atm, no Tm exists.
-#
-#   chi = 0   for noble gases (He, Ne, Ar, Kr): Pauling EN undefined for
-#             elements that form no stable bonds. Zero is the standard
-#             placeholder in all major ML-for-materials frameworks.
-
 PROPERTY_PATCHES = {
-    # ─────────────────────────────────────────────────────────────────────
-    # FORMAT: "Symbol": {"property": value, ...}
-    #
-    # EA = 0.0    anion unstable; standard convention when EA < 0
-    #             Source: Andersen (2004) Phys. Rep. 394, 157-313
-    # kappa       W/(m·K)  — CRC Handbook 95th Ed. (Haynes 2014)
-    # Tm / Tb     K        — CRC Handbook, stable allotrope at STP
-    # chi = 0.0   noble gases — Pauling EN undefined; placeholder used in
-    #             MAGPIE and all major descriptor frameworks
-    # magmom      μB (Bohr magnetons), solid-state ordered moment.
-    #             None in mendeleev for non-magnetic elements = physically 0,
-    #             not a data gap. Source: Kittel, ISSP 8th Ed.
-    #             Only ferromagnetic / strongly magnetic elements are non-zero:
-    #             Fe=2.22, Co=1.72, Ni=0.60, Gd=7.63, Dy=10.0 etc.
-    # ─────────────────────────────────────────────────────────────────────
-
     # s-block
     "H":  {"magmom": 0.0},
     "He": {"chi": 0.0,  "magmom": 0.0},
@@ -75,30 +57,30 @@ PROPERTY_PATCHES = {
     "Sr": {"kappa": 35.4,  "magmom": 0.0},
     "Cs": {"magmom": 0.0},
     "Ba": {"kappa": 18.4,  "magmom": 0.0},
-    "Fr": {},           # radioactive, sparse data — leave as-is
+    "Fr": {},
     "Ra": {},
 
     # p-block
     "B":  {"magmom": 0.0},
-    "C":  {"magmom": 0.0},                          # Tm deliberately omitted (sublimates)
+    "C":  {"magmom": 0.0},
     "N":  {"magmom": 0.0},
     "O":  {"magmom": 0.0},
     "F":  {"magmom": 0.0},
     "Ne": {"chi": 0.0,  "magmom": 0.0},
     "Al": {"magmom": 0.0},
     "Si": {"magmom": 0.0},
-    "P":  {"Tm": 317.3, "Tb": 553.6, "kappa": 0.236, "magmom": 0.0},   # white P
-    "S":  {"Tm": 388.4, "Tb": 717.8, "magmom": 0.0},                    # rhombic S
+    "P":  {"Tm": 317.3, "Tb": 553.6, "kappa": 0.236, "magmom": 0.0},
+    "S":  {"Tm": 388.4, "Tb": 717.8, "magmom": 0.0},
     "Cl": {"magmom": 0.0},
     "Ar": {"chi": 0.0,  "magmom": 0.0},
     "Ga": {"magmom": 0.0},
     "Ge": {"magmom": 0.0},
     "As": {"kappa": 50.2,  "magmom": 0.0},
-    "Se": {"Tm": 494.0,    "magmom": 0.0},                              # gray Se
+    "Se": {"Tm": 494.0,    "magmom": 0.0},
     "Br": {"magmom": 0.0},
     "Kr": {"chi": 0.0,  "magmom": 0.0},
     "In": {"magmom": 0.0},
-    "Sn": {"Tm": 505.1,    "magmom": 0.0},                              # white Sn
+    "Sn": {"Tm": 505.1,    "magmom": 0.0},
     "Sb": {"magmom": 0.0},
     "Te": {"magmom": 0.0},
     "I":  {"kappa": 0.449, "magmom": 0.0},
@@ -108,15 +90,12 @@ PROPERTY_PATCHES = {
     "Po": {"kappa": 20.0,  "magmom": 0.0},
     "At": {},
 
-    # d-block — transition metals
-    # Magnetic elements (non-zero magmom) left to mendeleev where available
-    # Non-magnetic ones patched to 0.0
+    # d-block
     "Sc": {"magmom": 0.0},
     "Ti": {"magmom": 0.0},
     "V":  {"magmom": 0.0},
-    "Cr": {"magmom": 0.0},                          # antiferromagnetic → 0 net
-    "Mn": {"EA": 0.0, "kappa": 7.81, "magmom": 0.0},  # antiferromagnetic → 0 net
-    # Fe, Co, Ni: ferromagnetic — mendeleev has their values, no patch needed
+    "Cr": {"magmom": 0.0},
+    "Mn": {"EA": 0.0, "kappa": 7.81, "magmom": 0.0},
     "Cu": {"magmom": 0.0},
     "Zn": {"EA": 0.0,  "magmom": 0.0},
     "Y":  {"kappa": 17.2,  "magmom": 0.0},
@@ -140,24 +119,22 @@ PROPERTY_PATCHES = {
     "Hg": {"EA": 0.0,  "magmom": 0.0},
     "Ac": {"kappa": 12.0, "magmom": 0.0},
 
-    # f-block — lanthanides and actinides
-    # Strongly magnetic lanthanides left to mendeleev
-    # Non-magnetic or closed-shell ones patched to 0
+    # f-block
     "La": {"magmom": 0.0},
-    "Ce": {"magmom": 0.0},                          # Ce is paramagnetic, ~0 ordered
-    "Pr": {},                                        # magnetic — mendeleev handles
-    "Nd": {"kappa": 16.5},                          # magnetic — leave magmom to mendeleev
+    "Ce": {"magmom": 0.0},
+    "Pr": {},
+    "Nd": {"kappa": 16.5},
     "Pm": {},
-    "Sm": {"kappa": 13.3},                          # magnetic
-    "Eu": {},                                        # magnetic
-    "Gd": {"kappa": 10.6},                          # strongly magnetic (7.63 μB)
-    "Tb": {},                                        # magnetic
-    "Dy": {},                                        # strongly magnetic
-    "Ho": {"kappa": 16.2},                          # magnetic
-    "Er": {"kappa": 14.5},                          # magnetic
-    "Tm": {"kappa": 16.9},                          # Thulium — magnetic
-    "Yb": {"magmom": 0.0},                          # non-magnetic (4f14)
-    "Lu": {"kappa": 16.4, "magmom": 0.0},           # non-magnetic (4f14 filled)
+    "Sm": {"kappa": 13.3},
+    "Eu": {},
+    "Gd": {"kappa": 10.6},
+    "Tb": {},
+    "Dy": {},
+    "Ho": {"kappa": 16.2},
+    "Er": {"kappa": 14.5},
+    "Tm": {"kappa": 16.9},
+    "Yb": {"magmom": 0.0},
+    "Lu": {"kappa": 16.4, "magmom": 0.0},
     "Th": {"magmom": 0.0},
     "U":  {"magmom": 0.0},
 }
@@ -191,42 +168,50 @@ def elem(sym):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Valence + d-shell + unpaired electrons
+# Valence + d-shell + p-shell + unpaired electrons
 # ══════════════════════════════════════════════════════════════════════════════
 
 def valence_props(e):
     """
-    Returns (val, vac, dcnt, dhalf, unpaired).
+    Returns (val, vac, dcnt, pcnt, dhalf, unpaired).
 
       val      valence electron count
       vac      valence shell vacancies
       dcnt     valence d-electron count — restricted to n == nmax-1 only
                (prevents overcounting for 4d/5d elements with filled 3d cores)
+      pcnt     valence p-electron count — sp-gaps are dominated by p-p orbital
+               interactions; complements dcnt. Restricted to n == nmax only.
       dhalf    |dcnt - 5|  (distance from half-filled d-shell)
       unpaired Hund's rule estimate of unpaired electrons (magnetic proxy)
     """
     conf = e.econf or ""
     parts = re.findall(r'(\d+)([spdf])(\d+)', conf)
     if not parts:
-        return 0.0, 0.0, 0.0, 5.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 5.0, 0.0
 
     shells = [(int(n), o, int(k)) for n, o, k in parts]
     nmax   = max(n for n, _, _ in shells)
     block  = e.block
-    val = cap = dcnt = 0
+    val = cap = dcnt = pcnt = 0
 
     for n, o, k in shells:
         if block in ("s", "p"):
             if n == nmax:
                 val += k
                 cap += {"s": 2, "p": 6}.get(o, 0)
+            # p-count: valence p-electrons at highest principal quantum number
+            if o == "p" and n == nmax:
+                pcnt += k
 
         elif block == "d":
             if (n == nmax and o == "s") or (n == nmax - 1 and o == "d"):
                 val += k
                 cap += {"s": 2, "d": 10}.get(o, 0)
-            if o == "d" and n == nmax - 1:          # valence d-shell only
+            if o == "d" and n == nmax - 1:
                 dcnt += k
+            # d-block elements can have residual p-electrons (e.g. post-d sp)
+            if o == "p" and n == nmax:
+                pcnt += k
 
         elif block == "f":
             if (
@@ -236,6 +221,8 @@ def valence_props(e):
             ):
                 val += k
                 cap += {"s": 2, "d": 10, "f": 14}.get(o, 0)
+            if o == "p" and n == nmax:
+                pcnt += k
 
     vac   = max(cap - val, 0)
     dhalf = abs(dcnt - 5)
@@ -249,7 +236,7 @@ def valence_props(e):
     else:
         unpaired = float(val % 2)
 
-    return float(val), float(vac), float(dcnt), float(dhalf), float(unpaired)
+    return float(val), float(vac), float(dcnt), float(pcnt), float(dhalf), float(unpaired)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -261,18 +248,22 @@ def vec(sym):
     """
     Return a fully patched dict of elemental properties for symbol `sym`.
 
+    New properties vs. previous version:
+      wf      Work function [eV] from mendeleev. Directly relates to band
+              alignment and gap magnitude — wide-gap insulators systematically
+              higher than narrow-gap semiconductors.
+      pcount  Valence p-electron count from valence_props(). Captures sp-gap
+              physics that dcount (d-electrons) misses.
+      period  Period number. Separates relativistic heavy elements (5d/6p)
+              from lighter analogues with identical val/dcount.
+
     Chemical hardness (η) unit check:
         I1   [eV]  — mendeleev ionenergies in eV
         EA   [eV]  — mendeleev electron_affinity in eV
         η = (I1 - EA) / 2  →  [eV]   CONSISTENT.
-
-    mendeleev computes hardness on the live element object using its own
-    stored EA. Since we patch EA on our side (not on the mendeleev object),
-    we must recompute η manually after patching — which is what the block
-    at the end of this function does.
     """
     e = elem(sym)
-    val, vac, dcnt, dhalf, unpaired = valence_props(e)
+    val, vac, dcnt, pcnt, dhalf, unpaired = valence_props(e)
 
     I1   = fnum(e.ionenergies.get(1) if e.ionenergies else None)
     EA   = fnum(getattr(e, "electron_affinity",  None))
@@ -289,6 +280,7 @@ def vec(sym):
         "val":      val,
         "vac":      vac,
         "dcount":   dcnt,
+        "pcount":   pcnt,           # NEW: valence p-electron count
         "dhalf":    dhalf,
         "unpaired": unpaired,
         "EA":       EA,
@@ -296,24 +288,16 @@ def vec(sym):
         "Tm":       fnum(getattr(e, "melting_point",         None)),
         "Tb":       fnum(getattr(e, "boiling_point",         None)),
         "kappa":    fnum(getattr(e, "thermal_conductivity",  None)),
-        # ── New properties ────────────────────────────────────────────────
-        # Cohesive energy: energy to atomise the elemental solid [kJ/mol].
-        # Directly links to formation enthalpy via Born-Haber cycle.
-        # Every classical formation energy model (Miedema, CALPHAD) uses it.
         "Ecoh":     fnum(getattr(e, "cohesive_energy",       None)),
-        # Solid-state magnetic moment [μB/atom].
-        # Distinct from `unpaired` (free-atom Hund's rule estimate):
-        # this is the actual ordered moment of the elemental solid,
-        # reflecting crystal-field quenching. Fe=2.22, Co=1.72, Ni=0.60.
-        # Non-magnetic elements patched to 0.0 in PROPERTY_PATCHES.
         "magmom":   fnum(getattr(e, "magnetic_moment",       None)),
+        "wf":       fnum(getattr(e, "work_function",         None)),  # NEW
+        "period":   fnum(getattr(e, "period",                None)),  # NEW
     }
 
-    # Step 1 — apply literature patches (EA is patched here if needed)
+    # Step 1 — apply literature patches
     patched = _apply_patches(sym, raw)
 
-    # Step 2 — compute hardness from Parr-Pearson if mendeleev returned None.
-    #           Units: (eV - eV) / 2 = eV  — consistent throughout.
+    # Step 2 — compute hardness from Parr-Pearson if mendeleev returned None
     if patched["hard"] is None:
         i1_p = patched["I1"]
         ea_p = patched["EA"]
@@ -332,31 +316,17 @@ def stats(key, values, w):
     Compute weighted descriptive statistics over elemental property `key`.
 
     Uses valid (non-None) entries only, with weights renormalised over
-    valid entries. The miss fraction feature is omitted — property gaps
-    are resolved by the patch table for all common elements.
+    valid entries.
 
-    Statistics returned (7 per property):
+    Statistics returned (8 per property):
       mean  weighted centroid
       std   weighted spread
-      min   lightest/smallest extreme element value (unweighted — the extreme
-            element matters regardless of its stoichiometric fraction)
-      max   heaviest/largest extreme element value  (same rationale)
-      mad   weighted mean absolute deviation — more robust than std for
-            small compositions; diverges from std when distribution is skewed
-      pos   (mean - min) / (max - min) — position of the weighted mean within
-            the property range. Independent of mean/std/min/max individually.
-            Answers: is the composition's centroid near its light or heavy
-            end? E.g. pos(chi) near 1 → high-EN element dominates by weight.
-      hmean weighted harmonic mean — 1 / Σ(wᵢ/xᵢ). Physically motivated for
-            properties that combine in series (e.g. radius in close-packed
-            structures, conductivity). Only defined for strictly positive
-            values — returns 0.0 when any xᵢ ≤ 0.
-      gmean weighted geometric mean — exp(Σ wᵢ·log|xᵢ|). Appropriate for
-            multiplicative properties (e.g. ionisation energies, volumes).
-            Always defined for non-zero values via log|x|.
-
-    NOTE: rng (= max - min) is intentionally excluded — it is fully
-    determined by min and max and adds no information to the feature set.
+      min   minimum element value (unweighted)
+      max   maximum element value (unweighted)
+      mad   weighted mean absolute deviation
+      pos   (mean - min) / (max - min)
+      hmean weighted harmonic mean (0.0 when any value ≤ 0)
+      gmean weighted geometric mean (0.0 when any value = 0)
 
     Returns a flat dict with prefixed keys: {key}_mean, {key}_std, etc.
     """
@@ -378,7 +348,7 @@ def stats(key, values, w):
 
     xv = np.array([v for v in values[mask]], dtype=float)
     wv = w[mask]
-    wv = wv / wv.sum()                          # renormalise over valid entries
+    wv = wv / wv.sum()
 
     mean = float(np.sum(wv * xv))
     std  = float(np.sqrt(np.sum(wv * (xv - mean) ** 2)))
@@ -388,21 +358,8 @@ def stats(key, values, w):
     rng  = vmax - vmin
     pos  = float((mean - vmin) / rng) if rng > 0 else 0.5
 
-    # Harmonic mean — only defined when all values are strictly positive.
-    # Returns 0.0 otherwise (e.g. properties that can be zero or negative
-    # like electron affinity, magnetic moment).
-    if np.all(xv > 0):
-        hmean = float(1.0 / np.sum(wv / xv))
-    else:
-        hmean = 0.0
-
-    # Geometric mean — defined for non-zero values via log|x|.
-    # Uses absolute value to handle signed properties (e.g. chi differences).
-    # Returns 0.0 if any value is exactly zero.
-    if np.all(xv != 0):
-        gmean = float(np.exp(np.sum(wv * np.log(np.abs(xv)))))
-    else:
-        gmean = 0.0
+    hmean = float(1.0 / np.sum(wv / xv)) if np.all(xv > 0) else 0.0
+    gmean = float(np.exp(np.sum(wv * np.log(np.abs(xv))))) if np.all(xv != 0) else 0.0
 
     return {
         f"{key}_mean":  mean,
@@ -427,25 +384,8 @@ def phys(elems, w, raw_counts=None):
     Args:
         elems      : list of element symbols
         w          : stoichiometric weights, normalised (sum = 1)
-        raw_counts : raw stoichiometric counts before normalisation,
-                     e.g. [2, 3] for Fe2O3. Required for n_atoms.
-                     If None, n_atoms falls back to w.sum() which is 1.0
-                     — so always pass raw_counts from featurize().
-
-    All weighted statistics use valid-only entries with renormalised
-    weights — no None-to-zero substitution anywhere.
-
-    Features added vs. previous version:
-      n_elements   number of distinct elements — strong structural prior;
-                   binary and quinary compounds with the same weighted-mean
-                   chi are physically very different materials.
-      n_atoms      total atom count per formula unit — formula unit size.
-                   Fe2O3 → 5. Assumes reduced formula (AFLOW/MP convention).
-      max_weight   stoichiometric fraction of the majority element — captures
-                   whether the composition is near-pure (max_weight → 1)
-                   or well-mixed (max_weight → 1/n_elements).
-                   Together with conf_entropy this fully characterises the
-                   stoichiometric distribution shape.
+        raw_counts : raw stoichiometric counts before normalisation.
+                     Required for n_atoms. If None, falls back to len(elems).
     """
     w      = np.array(w, dtype=float)
     w_norm = w / w.sum()
@@ -454,12 +394,12 @@ def phys(elems, w, raw_counts=None):
     radii, r_mask    = [], []
     masses, m_mask   = [], []
     vals, dhalf_arr, unpaired_arr = [], [], []
-    orb_counts_list  = []   # per-element valence electron counts by orbital type
+    orb_counts_list  = []
 
     for sym in elems:
-        v_dict = vec(sym)                       # patched values for chi/radius/mass
+        v_dict = vec(sym)
         e_obj  = elem(sym)
-        _, _, _, dh, up = valence_props(e_obj)
+        _, _, _, _, dh, up = valence_props(e_obj)   # updated signature (6 values)
 
         chi  = v_dict["chi"]
         rad  = v_dict["radius"]
@@ -473,10 +413,6 @@ def phys(elems, w, raw_counts=None):
         dhalf_arr.append(dh)
         unpaired_arr.append(up)
 
-        # ── Orbital electron counts for S_orb ────────────────────────────
-        # Count valence electrons by orbital type (s/p/d/f) using the same
-        # shell logic as valence_props(). Stored per element; aggregated
-        # stoichiometrically after the loop.
         conf  = e_obj.econf or ""
         parts = re.findall(r'(\d+)([spdf])(\d+)', conf)
         shells = [(int(n), o, int(k)) for n, o, k in parts]
@@ -505,8 +441,6 @@ def phys(elems, w, raw_counts=None):
     vals         = np.array(vals,         dtype=float)
     dhalf_arr    = np.array(dhalf_arr,    dtype=float)
     unpaired_arr = np.array(unpaired_arr, dtype=float)
-
-    # ── local helpers ─────────────────────────────────────────────────────
 
     def _wmean(arr, mask):
         arr, mask = np.array(arr, dtype=object), np.array(mask, dtype=bool)
@@ -539,36 +473,15 @@ def phys(elems, w, raw_counts=None):
         wv = w[mask]; wv = wv / wv.sum()
         return float(np.sqrt(np.sum(wv * (xv - mean) ** 2)))
 
-    # ── compute ───────────────────────────────────────────────────────────
-
     chi_mean = _wmean(chis,   chi_mask)
     r_mean   = _wmean(radii,  r_mask)
     m_mean   = _wmean(masses, m_mask)
     val_mean = float(np.sum(w_norm * vals))
     up_mean  = float(np.sum(w_norm * unpaired_arr))
 
-    # ── Magnetic entropy ──────────────────────────────────────────────────
-    # S_mag = Σᵢ wᵢ · ln(2Sᵢ + 1)   where Sᵢ = unpaired_i / 2
-    #
-    # Measures the degeneracy of spin microstates per atom.
-    # For Mn (d⁵, S=5/2): ln(6) ≈ 1.79.  For O (non-magnetic, S=0): ln(1) = 0.
-    # Distinct from unpaired_mean (linear spin count) — S_mag captures the
-    # logarithmic statistical weight, which is the thermodynamic driver for
-    # magnetic ordering. Directly relevant to hm_class.
     spin_arr = unpaired_arr / 2.0
     S_mag    = float(np.sum(w_norm * np.log(2.0 * spin_arr + 1.0)))
 
-    # ── Orbital entropy ───────────────────────────────────────────────────
-    # S_orb = -Σₒ pₒ · log(pₒ)   over orbital types o ∈ {s, p, d, f}
-    #
-    # pₒ = (Σᵢ wᵢ · nᵢₒ) / (Σₒ Σᵢ wᵢ · nᵢₒ)
-    # where nᵢₒ is the number of valence electrons of type o for element i.
-    #
-    # Measures how mixed the orbital character of the compound is.
-    # Pure sp compound (NaCl): low S_orb.
-    # Mixed spd compound (perovskite): higher S_orb.
-    # Relevant for egap and egap_type — orbital mixing determines
-    # whether bands hybridise to open or close a gap.
     total_orb = {o: 0.0 for o in "spdf"}
     for i, oc in enumerate(orb_counts_list):
         for o in "spdf":
@@ -576,69 +489,20 @@ def phys(elems, w, raw_counts=None):
     total_elec = sum(total_orb.values())
     if total_elec > 0:
         p_orb = np.array([total_orb[o] / total_elec for o in "spdf"])
-        p_orb = p_orb[p_orb > 0]            # drop zero terms (log(0) undefined)
+        p_orb = p_orb[p_orb > 0]
         S_orb = float(-np.sum(p_orb * np.log(p_orb)))
     else:
         S_orb = 0.0
 
     return {
-        # ── Stoichiometric structure ──────────────────────────────────────
-        # Number of distinct species — chemical complexity prior.
-        # Fe2O3 → 2, regardless of formula unit size.
         "n_elements":    float(len(elems)),
-
-        # Total atom count per formula unit — formula unit size.
-        # Fe2O3 → 5, Fe4O6 → 10 (same compound, different conventions).
-        # Assumes input compositions are already in reduced form (as in
-        # AFLOW, MP, ICSD). Relevant for formation enthalpy (more bonds →
-        # larger |ΔHf|) and structural complexity priors.
-        # Uses raw_counts (before normalisation) — w.sum() is always 1.0.
         "n_atoms":       float(raw_counts.sum()) if raw_counts is not None else float(len(elems)),
-
-        # Majority element stoichiometric fraction
-        # Near 1.0 → near-pure or dilute doping; near 1/n → equiatomic
         "max_weight":    float(w_norm.max()),
-
-        # Configurational entropy (high-entropy alloy formalism)
-        # Redundant with max_weight for simple binaries but captures
-        # full distribution shape for multicomponent compositions
         "conf_entropy":  float(-np.sum(w_norm * np.log(w_norm + 1e-12))),
-
-        # ── Magnetic entropy ──────────────────────────────────────────────
-        # S_mag = Σᵢ wᵢ · ln(2Sᵢ + 1).
-        # Logarithmic spin degeneracy — thermodynamic driver for magnetic
-        # ordering. Distinct from unpaired_mean (linear spin count).
         "S_mag":         S_mag,
-
-        # ── Orbital entropy ───────────────────────────────────────────────
-        # S_orb = -Σₒ pₒ · log(pₒ) over s/p/d/f valence electron fractions.
-        # Low → pure sp or pure d character. High → mixed spd/spdf.
-        # Captures orbital hybridisation potential relevant to band gap.
         "S_orb":         S_orb,
-
-        # ── Electronegativity mismatch → bond ionicity proxy ──────────────
-        # delta_chi: raw span from most electropositive to most electronegative
-        # element in the compound — directly analogous to Phillips ionicity
-        # and Pettifor structure maps. Unweighted because the extreme elements
-        # determine the bond polarity ceiling regardless of stoichiometry.
-        # chi_mad: stoichiometry-weighted average deviation — complements
-        # delta_chi by capturing how spread out the distribution is.
         "chi_mad":       _wmad(chis,   chi_mask, chi_mean),
         "delta_chi":     _wrng(chis,   chi_mask),
-
-        # ── Pairwise electronegativity interaction (Miedema-style) ────────
-        # pair_chi = Σᵢ<ⱼ  wᵢ · wⱼ · (χᵢ − χⱼ)²
-        #
-        # For ABX3 with w = [1/5, 1/5, 3/5]:
-        #   A–B: (1/5)(1/5)(χ_A−χ_B)²
-        #   A–X: (1/5)(3/5)(χ_A−χ_X)²
-        #   B–X: (1/5)(3/5)(χ_B−χ_X)²
-        #
-        # Distinct from delta_chi (span only) and chi_mad (deviation from
-        # mean): pair_chi weights each specific bond by how frequently those
-        # two atom types are neighbours (∝ wᵢ·wⱼ in a random solid solution).
-        # Grounded in Miedema's model where ΔH_mix ∝ (Δφ*)² with φ* ≈ χ.
-        # Missing chi values fall back to chi_mean (neutral imputation).
         "pair_chi":      float(sum(
                              w_norm[i] * w_norm[j] *
                              (
@@ -648,38 +512,17 @@ def phys(elems, w, raw_counts=None):
                              for i in range(len(elems))
                              for j in range(i + 1, len(elems))
                          )),
-
-        # ── Atomic size mismatch → lattice strain proxy ───────────────────
         "r_mad":         _wmad(radii,  r_mask, r_mean),
-
-        # ── Mass dispersion ───────────────────────────────────────────────
         "mass_std":      _wstd(masses, m_mask, m_mean),
-
-        # ── Valence electron statistics ───────────────────────────────────
         "val_mean":      val_mean,
         "val_var":       float(np.sum(w_norm * (vals - val_mean) ** 2)),
-
-        # ── d-shell half-filling → proximity to Hund's maximum ───────────
         "dhalf_mean":    float(np.sum(w_norm * dhalf_arr)),
-
-        # ── Transition metal (d-block) fraction ──────────────────────────
         "tm_frac":       float(np.sum(w_norm * np.array(
                              [elem(s).block == "d" for s in elems], dtype=float
                          ))),
-
-        # ── f-block (lanthanide / actinide) fraction ──────────────────────
-        # Analogous to tm_frac. Rare-earth magnets (SmCo, NdFeB analogues)
-        # and heavy-fermion systems are characterised by high f_frac.
-        # Without this, all-lanthanide and all-d-block compounds look
-        # identical to the model from the tm_frac perspective.
         "f_frac":        float(np.sum(w_norm * np.array(
                              [elem(s).block == "f" for s in elems], dtype=float
                          ))),
-
-        # ── Unpaired electron statistics → magnetic moment proxy ──────────
-        # Directly relevant to half-metal / spintronic classification.
-        # unpaired_var captures whether all elements contribute equally
-        # to spin (low var) or one element dominates (high var).
         "unpaired_mean": up_mean,
         "unpaired_var":  float(np.sum(w_norm * (unpaired_arr - up_mean) ** 2)),
     }
@@ -698,23 +541,24 @@ def featurize(df, elements_col="elements", composition_col="composition"):
       composition_col list of stoichiometric counts, e.g. [1, 2]  (FeO2)
 
     Returns the original DataFrame concatenated with all feature columns.
-    Feature count: 19 properties x 7 stats = 133 elemental features
-                   (mean, std, min, max, mad, pos, hmean, gmean)
-                   Properties: Z, mass, chi, radius, volume, polar, hard,
-                   val, vac, dcount, dhalf, unpaired, EA, I1, Tm, Tb,
-                   kappa, Ecoh, magmom
-                 + 18 physics features:
-                   n_elements, n_atoms, max_weight,
-                   conf_entropy, S_mag, S_orb,
-                   chi_mad, delta_chi, pair_chi, r_mad, mass_std,
-                   val_mean, val_var, dhalf_mean,
-                   tm_frac, f_frac,
-                   unpaired_mean, unpaired_var
-                 = 151 features total
 
-    NOTE: n_atoms is convention-dependent (Fe2O3=5, Fe4O6=10 for the same
-    compound). Ensure compositions are reduced to lowest integer ratios
-    before calling featurize() for this feature to be meaningful.
+    Feature count:
+      22 properties × 8 stats = 176 elemental features
+        Properties: Z, mass, chi, radius, volume, polar, hard,
+                    val, vac, dcount, pcount, dhalf, unpaired,
+                    EA, I1, Tm, Tb, kappa, Ecoh, magmom,
+                    wf, period
+        Stats per property: mean, std, min, max, mad, pos, hmean, gmean
+
+      18 physics features:
+        n_elements, n_atoms, max_weight,
+        conf_entropy, S_mag, S_orb,
+        chi_mad, delta_chi, pair_chi, r_mad, mass_std,
+        val_mean, val_var, dhalf_mean,
+        tm_frac, f_frac,
+        unpaired_mean, unpaired_var
+
+      = 194 features total  (was 151)
     """
     out = []
 
@@ -729,21 +573,15 @@ def featurize(df, elements_col="elements", composition_col="composition"):
             )
         w = comp / s
 
-        # All property dicts cached after first call per element
         elem_dicts = [vec(e) for e in elems]
         keys       = list(elem_dicts[0].keys())
 
         feats = {}
 
-        # Weighted statistics per elemental property  (5 stats × 19 props = 95)
         for k in keys:
             col_values = [d[k] for d in elem_dicts]
             feats.update(stats(k, col_values, w))
 
-        # Composition-level physics features  (15 features)
-        # Pass both normalised weights (w) and raw counts (comp) so phys()
-        # can compute n_atoms = comp.sum() correctly.
-        # w.sum() is always 1.0 after normalisation — not the atom count.
         feats.update(phys(elems, w, comp))
 
         out.append(feats)
