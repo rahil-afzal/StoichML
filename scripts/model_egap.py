@@ -39,7 +39,7 @@ matplotlib.use("Agg")
 
 # ── Output directory ──────────────────────────────────────────────────────────
 OUT_DIR = Path("models/egap")
-
+IMG_DIR = OUT_DIR / "images"
 # ── Band gap bins ─────────────────────────────────────────────────────────────
 BINS       = [0.0, 0.5, 1.0, 2.0, 4.0, 6.0, 9.5]
 BIN_LABELS = ["0–0.5", "0.5–1", "1–2", "2–4", "4–6", "6–9.5"]
@@ -321,7 +321,7 @@ def plot_diagnostics(y_true: np.ndarray,
     ax.legend(fontsize=8)
 
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=1200, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved → {out_path}")
 
@@ -329,7 +329,7 @@ def plot_diagnostics(y_true: np.ndarray,
 def plot_feature_importance(feat_importances: list[np.ndarray],
                             feature_names: list[str],
                             out_path: Path,
-                            top_n: int = 30) -> None:
+                            top_n: int = 10) -> None:
     mean_imp = np.mean(feat_importances, axis=0)
     std_imp  = np.std(feat_importances,  axis=0)
     idx      = np.argsort(mean_imp)[-top_n:][::-1]
@@ -348,7 +348,7 @@ def plot_feature_importance(feat_importances: list[np.ndarray],
                  f"(mean ± std, {len(feat_importances)} folds)")
     ax.invert_yaxis()
     plt.tight_layout()
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(out_path, dpi=1200, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved → {out_path}")
 
@@ -436,12 +436,12 @@ def main() -> None:
          "ensemble_error_diagnostics.png"),
     ]:
         plot_diagnostics(y, oof, bstats, label,
-                         OUT_DIR / fname, args.egap_filter)
+                         IMG_DIR / fname, args.egap_filter)
 
     plot_feature_importance(
         cv["feat_importances"],
         cv["feature_names"],
-        OUT_DIR / "feature_importance.png",
+        IMG_DIR / "feature_importance.png",
     )
 
     # Save metrics
