@@ -1,3 +1,31 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+shap_analysis.py
+────────────────
+Unified SHAP analysis for all StoichML tasks.
+
+For each task: SHAP beeswarm (summary) + bar (mean |SHAP|) plots.
+Seed-ensemble tasks (egap_type, hm_class stage 1) average SHAP values
+across all seed models for stability.
+
+Tasks
+  enthalpy    regression       single LGBM model
+  egap        regression       single LGBM model
+  egap_type   binary           mean SHAP across 5-seed LGBM ensemble
+  hm_class    binary (stage 1) mean SHAP across 5-seed LGBM ensemble
+                               stage 1 only — half-metal vs not
+
+Outputs  shap_outputs/{task}/
+  shap_summary_{task}.png     beeswarm coloured by feature value
+  shap_bar_{task}.png         mean |SHAP| bar chart
+
+Usage
+  python shap_analysis.py --task enthalpy
+  python shap_analysis.py --task all
+  python shap_analysis.py --task all --max_samples 5000
+"""
+
 import argparse
 import json
 import os
@@ -5,219 +33,265 @@ import joblib
 import numpy as np
 import pandas as pd
 import shap
+import matplotlib
 import matplotlib.pyplot as plt
-import logging
 
-# =====================
-# Logging & Random Seed
-# =====================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-RANDOM_STATE = 42
-np.random.seed(RANDOM_STATE)
+matplotlib.use("Agg")
 
-# =====================
-# Paths & Constants
-# =====================
-DATA_PATH = "data/data_feat.pkl"
-FEATURES_JSON = "data/selected_features.json"
-MODEL_BASE_DIR = "models"
-OUT_DIR = "shap_outputs"
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
 
-MAX_SAMPLES = 10000
-TOP_K = 8
-DPI = 1200
+RANDOM_STATE   = 42
+DATA_PATH      = "data/data_feat.pkl"
+FEATURES_JSON  = "data/selected_features.json"
+MODEL_DIR      = "models"
+OUT_DIR        = "shap_outputs"
 
-# =====================
-# Task Registry
-# =====================
+MAX_SAMPLES    = 10000
+TOP_K          = 20
+DPI            = 150
+
+UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
+
+# Task registry
+# type:       how to extract SHAP values
+# model_path: callable(seed=None) -> path string
 TASKS = {
-    "enthalpy": {"target": "enthalpy_formation_atom", "type": "regression"},
-    "egap": {"target": "Egap", "type": "regression"},
-    "egap_type": {"target": "Egap_type_numeric", "type": "binary"},
+    "enthalpy": {
+        "type":         "regression",
+        "features_key": "enthalpy",
+        "model_paths":  lambda: [os.path.join(MODEL_DIR, "enthalpy", "enthalpy_lgbm.pkl")],
+    },
+    "egap": {
+        "type":         "regression",
+        "features_key": "egap",
+        "model_paths":  lambda: [os.path.join(MODEL_DIR, "egap", "egap_lgbm.pkl")],
+    },
+    "egap_type": {
+        "type":         "binary",
+        "features_key": "egap_type",
+        "model_paths":  lambda: [
+            os.path.join(MODEL_DIR, "egap_type", f"egap_type_lgbm_seed{s}.pkl")
+            for s in UNDERSAMPLE_SEEDS
+        ],
+    },
     "hm_class": {
-        "target": "hm_class",
-        "type": "multiclass",
-        "num_class": 3,
-        "shap_class": 2,
+        "type":         "binary",          # stage 1 only — half-metal vs not
+        "features_key": "hm_class",
+        "model_paths":  lambda: [
+            os.path.join(MODEL_DIR, "hm_class", f"stage1_lgbm_seed{s}.pkl")
+            for s in UNDERSAMPLE_SEEDS
+        ],
+        "shap_class":   1,                 # class 1 = half-metal
     },
 }
 
-# =====================
-# Helper Functions
-# =====================
-def load_features(task: str) -> list:
-    """Load combined core + task-specific features from JSON."""
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_features(task: str) -> list[str]:
     with open(FEATURES_JSON) as f:
         feats = json.load(f)
-    core = feats.get("core", [])
-    task_feats = feats.get(task, [])
-    return list(dict.fromkeys(core + task_feats))
+    key = TASKS[task]["features_key"]
+    task_feats = feats.get(key, [])
+    if not task_feats:
+        raise ValueError(f"No features found for '{key}' in {FEATURES_JSON}.")
+    return task_feats
 
 
-def select_shap_values(raw_sv, cfg):
+def extract_shap(raw_sv, task_type: str, shap_class: int = 1) -> np.ndarray:
     """
-    Normalize SHAP output across regression, binary, and multiclass cases.
-    Always return array of shape (n_samples, n_features).
+    Normalise SHAP output to (n_samples, n_features) regardless of
+    how TreeExplainer returned it (list, 2D, 3D).
     """
-    if cfg["type"] == "regression":
-        return raw_sv
+    if task_type == "regression":
+        return np.array(raw_sv)
 
-    if cfg["type"] == "binary":
-        # Sometimes list, sometimes 3D
+    if task_type == "binary":
         if isinstance(raw_sv, list):
-            return raw_sv[1]
+            return np.array(raw_sv[shap_class])
         if raw_sv.ndim == 3:
-            return raw_sv[:, :, 1]
-        return raw_sv
+            # (n_samples, n_features, n_classes) or (n_classes, n_samples, n_features)
+            if raw_sv.shape[-1] == 2:
+                return raw_sv[:, :, shap_class]
+            return raw_sv[shap_class]
+        return np.array(raw_sv)
 
-    if cfg["type"] == "multiclass":
-        class_id = cfg.get("shap_class", 0)
-
-        # Case 1: list[num_classes]
-        if isinstance(raw_sv, list):
-            return raw_sv[class_id]
-
-        # Case 2: (n_samples, n_features, num_classes)
-        if raw_sv.ndim == 3 and raw_sv.shape[2] == cfg["num_class"]:
-            return raw_sv[:, :, class_id]
-
-        # Case 3: (num_classes, n_samples, n_features)
-        if raw_sv.ndim == 3 and raw_sv.shape[0] == cfg["num_class"]:
-            return raw_sv[class_id]
-
-    raise RuntimeError(f"Unexpected SHAP output shape: {type(raw_sv)}")
-
-    """Select SHAP values according to task type."""
-    if cfg["type"] == "regression":
-        return raw_sv
-    if cfg["type"] == "binary":
-        return raw_sv[1]
-    if cfg["type"] == "multiclass":
-        return raw_sv[cfg.get("shap_class", 0)]
-    raise RuntimeError(f"Unknown task type: {cfg['type']}")
+    raise ValueError(f"Unknown task type: {task_type}")
 
 
-def get_model_path(task: str, model_name: str) -> str:
-    """Return the path to the model stored in models/{task}/{task}_{model}.pkl."""
-    return os.path.join(MODEL_BASE_DIR, task, f"{task}_{model_name}.pkl")
+# ══════════════════════════════════════════════════════════════════════════════
+# PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_beeswarm(shap_vals: np.ndarray,
+                  X: pd.DataFrame,
+                  title: str,
+                  fname: str,
+                  top_k: int = TOP_K) -> None:
+    """SHAP beeswarm plot — shows direction and magnitude of each feature."""
+    mean_abs   = np.abs(shap_vals).mean(axis=0)
+    top_idx    = np.argsort(mean_abs)[-top_k:][::-1]
+    top_feats  = X.columns[top_idx]
+    X_top      = X[top_feats]
+    sv_top     = shap_vals[:, top_idx]
+
+    fig, ax = plt.subplots(figsize=(8, max(5, top_k * 0.32)))
+    shap.summary_plot(sv_top, X_top, show=False, max_display=top_k, plot_size=None)
+    plt.title(title, fontsize=11, fontweight="bold", pad=10)
+    plt.tight_layout()
+    fig.savefig(fname, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {fname}")
 
 
-# =====================
-# SHAP Analysis Routine
-# =====================
-def run_shap(task_name: str, max_samples: int = MAX_SAMPLES):
-    """Run SHAP analysis for one task."""
+def plot_bar(shap_vals: np.ndarray,
+             X: pd.DataFrame,
+             title: str,
+             fname: str,
+             top_k: int = TOP_K) -> None:
+    """Mean |SHAP| bar chart."""
+    mean_abs   = np.abs(shap_vals).mean(axis=0)
+    top_idx    = np.argsort(mean_abs)[-top_k:][::-1]
+    top_feats  = X.columns[top_idx]
+    X_top      = X[top_feats]
+    sv_top     = shap_vals[:, top_idx]
+
+    fig, ax = plt.subplots(figsize=(8, max(5, top_k * 0.32)))
+    shap.summary_plot(sv_top, X_top, plot_type="bar", show=False,
+                      max_display=top_k, plot_size=None)
+    plt.title(title, fontsize=11, fontweight="bold", pad=10)
+    plt.tight_layout()
+    fig.savefig(fname, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved → {fname}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN ANALYSIS ROUTINE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def run_shap(task_name: str, max_samples: int = MAX_SAMPLES) -> None:
     cfg = TASKS[task_name]
-    logging.info(f"Starting SHAP analysis for task: {task_name}")
+
+    print(f"\n{'═' * 55}")
+    print(f"  SHAP — {task_name}")
+    print(f"{'═' * 55}")
 
     # Load data
-    try:
-        df = pd.read_pickle(DATA_PATH)
-    except FileNotFoundError:
-        logging.error(f"Data file not found: {DATA_PATH}")
-        return
+    df    = pd.read_pickle(DATA_PATH)
+    feats = load_features(task_name)
 
-    features = load_features(task_name)
-    X = df[features]
+    # For egap, filter to insulators only (matches training distribution)
+    if task_name == "egap":
+        df = df[df["Egap"] > 0.1].reset_index(drop=True)
+
+    X = df[feats]
 
     if len(X) > max_samples:
-        X = X.sample(max_samples, random_state=RANDOM_STATE)
-        logging.info(f"Sampled {max_samples} rows.")
+        X = X.sample(max_samples, random_state=RANDOM_STATE).reset_index(drop=True)
+        print(f"  Sampled {max_samples} / {len(df)} rows")
+    else:
+        print(f"  Using all {len(X)} rows")
 
-    # Load models from task-specific folder
-    models = {}
-    for name in ["lgbm", "xgb"]:
-        path = get_model_path(task_name, name)
-        try:
-            models[name] = joblib.load(path)
-        except FileNotFoundError:
-            logging.warning(f"Model not found: {path}, skipping.")
+    # Load models
+    model_paths = cfg["model_paths"]()
+    models = []
+    for path in model_paths:
+        if not os.path.exists(path):
+            print(f"  WARNING: model not found — {path}")
+            continue
+        models.append(joblib.load(path))
 
     if not models:
-        logging.error("No models loaded. Skipping task.")
+        print(f"  No models found for {task_name} — skipping.")
         return
 
-    for name, model in models.items():
-        model_tag = "LGBM" if name == "lgbm" else "XGBoost"
-        out_path = os.path.join(OUT_DIR, task_name, name)
-        os.makedirs(out_path, exist_ok=True)
+    print(f"  Loaded {len(models)} model(s)")
 
-        # SHAP Explainer
-        try:
-            explainer = shap.TreeExplainer(model)
-        except Exception as e:
-            logging.warning(f"Failed to create SHAP explainer for {model_tag}: {e}")
-            continue
+    # Compute SHAP values — average across models if seed ensemble
+    task_type  = cfg["type"]
+    shap_class = cfg.get("shap_class", 1)
 
-        raw_sv = explainer.shap_values(X)
-        shap_vals = select_shap_values(raw_sv, cfg)
+    all_shap = []
+    for i, model in enumerate(models, 1):
+        print(f"  Computing SHAP  [{i}/{len(models)}] ...", end="\r")
+        explainer = shap.TreeExplainer(model)
+        raw_sv    = explainer.shap_values(X)
+        sv        = extract_shap(raw_sv, task_type, shap_class)
+        all_shap.append(sv)
 
-        # Top features
-        mean_abs = np.abs(shap_vals).mean(axis=0)
-        imp = pd.Series(mean_abs, index=X.columns).sort_values(ascending=False)
-        top_feats = imp.index[:TOP_K]
-        top_idx = [X.columns.get_loc(f) for f in top_feats]
+    shap_vals = np.mean(all_shap, axis=0)   # (n_samples, n_features)
+    print(f"  SHAP computed — shape {shap_vals.shape}          ")
 
-        X_top = X[top_feats]
-        shap_top = shap_vals[:, top_idx]
+    # Output directory
+    out_path = os.path.join(OUT_DIR, task_name)
+    os.makedirs(out_path, exist_ok=True)
 
-        # Save SHAP values
-        np.save(os.path.join(out_path, f"shap_values_{model_tag}_{task_name}.npy"), shap_vals)
+    # Titles
+    type_label = {
+        "enthalpy":  "Formation Enthalpy Regression",
+        "egap":      "Band Gap Regression (Egap > 0.1 eV)",
+        "egap_type": "Metal vs Insulator Classification",
+        "hm_class":  "Half-metal Detector (Stage 1)",
+    }
+    n_models_str = f"{len(models)} seed model avg" if len(models) > 1 else "single model"
+    title_base   = f"{type_label[task_name]}  ({n_models_str})"
 
-        # ---- Summary Plot ----
-        plt.figure(figsize=(7, 6))
-        shap.summary_plot(shap_top, X_top, show=False, max_display=TOP_K)
-        plt.suptitle(f"SHAP Summary – {model_tag} ({task_name.capitalize()})", fontsize=11)
-        plt.figtext(0.5, -0.08,
-                    f"Top {TOP_K} features for {task_name} using {model_tag}.",
-                    ha="center", fontsize=9, wrap=True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_path, f"shap_summary_{model_tag}_{task_name}.png"), dpi=DPI, bbox_inches="tight")
-        plt.close()
+    # Beeswarm
+    plot_beeswarm(
+        shap_vals, X,
+        title = f"SHAP Summary — {title_base}",
+        fname = os.path.join(out_path, f"shap_summary_{task_name}.png"),
+    )
 
-        # ---- Bar Plot ----
-        plt.figure(figsize=(7, 6))
-        shap.summary_plot(shap_top, X_top, plot_type="bar", show=False)
-        plt.suptitle(f"Mean |SHAP| Importance – {model_tag} ({task_name.capitalize()})", fontsize=11)
-        plt.figtext(0.5, -0.08,
-                    f"Mean absolute SHAP values of top {TOP_K} features for {task_name} using {model_tag}.",
-                    ha="center", fontsize=9, wrap=True)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_path, f"shap_bar_{model_tag}_{task_name}.png"), dpi=DPI, bbox_inches="tight")
-        plt.close()
+    # Bar
+    plot_bar(
+        shap_vals, X,
+        title = f"Mean |SHAP| — {title_base}",
+        fname = os.path.join(out_path, f"shap_bar_{task_name}.png"),
+    )
 
-        # ---- Dependence Plots ----
-        for feat in top_feats:
-            plt.figure(figsize=(6, 5))
-            shap.dependence_plot(feat, shap_vals, X, show=False)
-            plt.suptitle(f"{feat} vs SHAP – {model_tag} ({task_name})", fontsize=11)
-            plt.figtext(0.5, -0.15,
-                        f"Feature '{feat}' influence on {task_name} prediction in {model_tag}.",
-                        ha="center", fontsize=9, wrap=True)
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_path, f"shap_dependence_{feat}_{model_tag}_{task_name}.png"),
-                        dpi=DPI, bbox_inches="tight")
-            plt.close()
-
-        logging.info(f"Completed SHAP for {model_tag}")
-
-    logging.info(f"Finished task: {task_name}")
+    print(f"  Done — {task_name}")
 
 
-# =====================
+# ══════════════════════════════════════════════════════════════════════════════
 # CLI
-# =====================
+# ══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="SHAP analysis for materials ML tasks")
-    parser.add_argument("--task", required=True, choices=list(TASKS.keys()) + ["all"], help="Task name or 'all'")
-    parser.add_argument("--max_samples", type=int, default=MAX_SAMPLES, help="Max number of samples to use")
+    parser = argparse.ArgumentParser(
+        description="Unified SHAP analysis for StoichML tasks.",
+        epilog=(
+            "Examples:\n"
+            "  python shap_analysis.py --task enthalpy\n"
+            "  python shap_analysis.py --task all\n"
+            "  python shap_analysis.py --task all --max_samples 5000"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--task",
+        required=True,
+        choices=list(TASKS.keys()) + ["all"],
+        help="Task to analyse, or 'all' to run all tasks.",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=MAX_SAMPLES,
+        help=f"Max samples for SHAP computation (default: {MAX_SAMPLES}).",
+    )
     args = parser.parse_args()
 
-    if args.task == "all":
-        for t in TASKS.keys():
-            run_shap(t, max_samples=args.max_samples)
-    else:
-        run_shap(args.task, max_samples=args.max_samples)
+    tasks_to_run = list(TASKS.keys()) if args.task == "all" else [args.task]
+
+    for task in tasks_to_run:
+        run_shap(task, max_samples=args.max_samples)
+
+    print(f"\n{'═' * 55}")
+    print(f"  All outputs in: {OUT_DIR}/")
+    print(f"{'═' * 55}")
