@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-shap_analysis.py
+shap.py
 ────────────────
 Unified SHAP analysis for all StoichML tasks.
 
@@ -21,9 +21,9 @@ Outputs  shap_outputs/{task}/
   shap_bar_{task}.png         mean |SHAP| bar chart
 
 Usage
-  python shap_analysis.py --task enthalpy
-  python shap_analysis.py --task all
-  python shap_analysis.py --task all --max_samples 5000
+  python shap.py --task enthalpy
+  python shap.py --task all
+  python shap.py --task all --max_samples 5000
 """
 
 import argparse
@@ -49,8 +49,8 @@ MODEL_DIR      = "models"
 OUT_DIR        = "shap_outputs"
 
 MAX_SAMPLES    = 10000
-TOP_K          = 20
-DPI            = 150
+TOP_K          = 10
+DPI            = 1500
 
 UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
 
@@ -168,8 +168,66 @@ def plot_bar(shap_vals: np.ndarray,
     fig.savefig(fname, dpi=DPI, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved → {fname}")
+def plot_dependence(shap_vals: np.ndarray,
+                    X: pd.DataFrame,
+                    title_prefix: str,
+                    out_dir: str,
+                    task_name: str,
+                    top_n: int = 3) -> None:
+    """SHAP dependence plots for top-N features, colour-coded by top interaction."""
+    mean_abs  = np.abs(shap_vals).mean(axis=0)
+    top_idx   = np.argsort(mean_abs)[-top_n:][::-1]
+    top_feats = [X.columns[i] for i in top_idx]
 
+    for feat in top_feats:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        shap.dependence_plot(
+            feat,
+            shap_vals,
+            X,
+            ax=ax,
+            show=False,
+        )
+        ax.set_title(
+            f"{title_prefix} — {feat}",
+            fontsize=11, fontweight="bold",
+        )
+        plt.tight_layout()
+        fname = os.path.join(out_dir, f"shap_dependence_{feat}_{task_name}.png")
+        fig.savefig(fname, dpi=DPI, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved → {fname}")
+def save_feature_importance(shap_vals: np.ndarray,
+                             X: pd.DataFrame,
+                             task_name: str,
+                             out_dir: str,
+                             top_k: int = TOP_K) -> None:
+    """Save ranked feature importance table as CSV and print to console."""
+    mean_abs = np.abs(shap_vals).mean(axis=0)
+    std_abs  = np.abs(shap_vals).std(axis=0)
 
+    importance = pd.DataFrame({
+        "feature":      X.columns,
+        "mean_abs_shap": mean_abs,
+        "std_abs_shap":  std_abs,
+    }).sort_values("mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    importance.index += 1   # rank starts at 1
+    importance.index.name = "rank"
+
+    # Save full table
+    csv_path = os.path.join(out_dir, f"feature_importance_{task_name}.csv")
+    importance.to_csv(csv_path)
+    print(f"  Saved → {csv_path}")
+
+    # Print top-K to console
+    print(f"\n  Top {top_k} features — {task_name}")
+    print(f"  {'Rank':<6} {'Feature':<35} {'Mean |SHAP|':>12} {'Std':>10}")
+    print(f"  {'─' * 67}")
+    for rank, row in importance.head(top_k).iterrows():
+        print(f"  {rank:<6} {row['feature']:<35} "
+              f"{row['mean_abs_shap']:>12.5f} "
+              f"{row['std_abs_shap']:>10.5f}")
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN ANALYSIS ROUTINE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -256,8 +314,15 @@ def run_shap(task_name: str, max_samples: int = MAX_SAMPLES) -> None:
     )
 
     print(f"  Done — {task_name}")
-
-
+# Dependence plots — top 3 features
+    plot_dependence(
+        shap_vals, X,
+        title_prefix = title_base,
+        out_dir      = out_path,
+        task_name    = task_name,
+    )
+# Feature importance table
+    save_feature_importance(shap_vals, X, task_name, out_path)
 # ══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,5 +1,5 @@
 """
-egap_benchmark.py
+model_egap.py
 ─────────────────
 Band gap regression benchmark — LGBM + XGBoost ensemble.
 Trains on insulators (Egap > egap_filter) using composition-only features.
@@ -13,9 +13,9 @@ Outputs (all saved to models/egap/)
 
 Usage
 -----
-  python egap_benchmark.py
-  python egap_benchmark.py --egap_filter 0.1
-  python egap_benchmark.py --feat_path data/data_feat.pkl --egap_filter 0.0
+  python model_egap.py
+  python model_egap.py --egap_filter 0.1
+  python model_egap.py --feat_path data/data_feat.pkl --egap_filter 0.0
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import json
 import time
 from pathlib import Path
 
+import joblib
 import lightgbm as lgb
 import matplotlib
 import matplotlib.colors as mcolors
@@ -401,7 +402,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-
+    IMG_DIR.mkdir(parents=True, exist_ok=True)
     print(f"\n{'═' * 55}")
     print(f"  Band Gap Benchmark  |  Egap > {args.egap_filter} eV")
     print(f"{'═' * 55}")
@@ -443,7 +444,18 @@ def main() -> None:
         cv["feature_names"],
         IMG_DIR / "feature_importance.png",
     )
-
+    # Final fit
+    mean_iter_lgb = max(1, int(np.mean(cv["best_iters_lgb"])))
+    mean_iter_xgb = max(1, int(np.mean(cv["best_iters_xgb"])))
+    print(f"\n  Final fit — LGBM iter={mean_iter_lgb}  XGB iter={mean_iter_xgb}")
+    final_lgb = build_lgbm(n_estimators=mean_iter_lgb)
+    final_xgb = build_xgb(n_estimators=mean_iter_xgb, early_stopping=False)
+    final_lgb.fit(X, y)
+    final_xgb.fit(X, y)
+    joblib.dump(final_lgb, OUT_DIR / "egap_lgbm.pkl")
+    joblib.dump(final_xgb, OUT_DIR / "egap_xgb.pkl")
+    print(f"  Saved → {OUT_DIR}/egap_lgbm.pkl")
+    print(f"  Saved → {OUT_DIR}/egap_xgb.pkl")
     # Save metrics
     save_metrics(y, cv, metrics, args.egap_filter)
 

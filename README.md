@@ -76,6 +76,7 @@ StoichML/
 │
 ├── stoichml/
 │   └── featurizer.py             # core featurizer — vec(), stats(), phys()
+
 │
 ├── scripts/
 │   ├── model_train.py            # training pipeline (--task flag)
@@ -130,17 +131,9 @@ tabulate         # property audit script
 
 ## Quickstart
 
-### 1. Check elemental property coverage
 
-Before featurizing, audit which elements in your dataset have missing properties and which are resolved by the patch table:
 
-```bash
-python -m scripts.property_audit
-# → prints per-property missingness summary
-# → exports property_audit_full.csv and property_audit_missing_only.csv
-```
-
-### 2. Featurize your dataset
+### 1. Featurize your dataset
 
 Your input DataFrame needs two columns:
 - `elements` — list of element symbols, e.g. `["Fe", "O"]`
@@ -166,12 +159,12 @@ df_feat = featurize(df)
 
 > ⚠️ `n_atoms` is convention-dependent. Provide compositions in lowest integer ratios (Fe₂O₃ not Fe₄O₆). AFLOW data is already reduced.
 
-### 3. Run feature pruning
+### 2. Run feature pruning
 
 Selects the minimal feature set per task using 5-fold CV-averaged gain importances. Physics features are **force-retained** regardless of importance score — domain knowledge takes precedence over data-driven pruning for features with explicit physical justification.
 
 ```bash
-python -m scripts.feature_pruning_lgbm
+python -m scripts.feature_selection
 # → writes data/selected_features.json
 ```
 
@@ -181,9 +174,9 @@ The pruning script reports which physics features fall below the signal threshol
 
 ```bash
 python -m scripts.model_train --task enthalpy
-python -m scripts.model_train --task egap
 python -m scripts.model_train --task egap_type
-python -m scripts.model_train --task hm_class
+python -m scripts.model_egap
+python -m scripts.model_hm 
 ```
 
 Each run:

@@ -65,7 +65,7 @@ TASKS = {
     "egap_type": {
         "type":           "binary_ensemble",
         "target":         "Egap_type_numeric",
-        "minority_class": 1,
+        "minority_class": 1,    # Insulator is minority class
     },
 }
 
@@ -224,7 +224,6 @@ def build_xgb_regression(
 def build_lgbm_binary(n_estimators: int = 5000) -> lgb.LGBMClassifier:
     return lgb.LGBMClassifier(
         objective="binary",
-        num_class=1,
         learning_rate=0.05,
         num_leaves=64,
         n_estimators=n_estimators,
@@ -358,9 +357,10 @@ def train_egap_type(task_name: str, cfg: dict) -> None:
     X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns],
                 errors="ignore")[feats]
     y = df[cfg["target"]]
-
+    mask = y.isin([0, 1])
+    X    = X.loc[mask].reset_index(drop=True)
+    y    = y.loc[mask].reset_index(drop=True)
     minority_class = cfg["minority_class"]
-
     print(f"\n  {len(y)} samples")
     print(f"  Class 0 (Conductor): {(y == 0).sum()}")
     print(f"  Class 1 (Insulator): {(y == 1).sum()}")
