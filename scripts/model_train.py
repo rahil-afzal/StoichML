@@ -61,18 +61,25 @@ TASKS = {
         "type":      "regression",
         "target":    "enthalpy_formation_atom",
         "transform": None,
+        "data_path": "data/data_feat.pkl",
     },
     "egap_type": {
         "type":           "binary_ensemble",
         "target":         "Egap_type_numeric",
-        "minority_class": 1,    # Insulator is minority class
+        "minority_class": 1,
+        "data_path":      "data/data_feat.pkl",
+    },
+    "supercon": {
+        "type":      "regression",
+        "target":    "Tc",
+        "transform": None,
+        "data_path": "data/supercon_feat.pkl",   # ← different file
     },
 }
-
 NON_FEATURE_COLS = [
-    "compound", "spacegroup_relax", "Egap", "Egap_type",
+    "compound", "compounds", "spacegroup_relax", "Egap", "Egap_type",
     "Egap_type_numeric", "enthalpy_formation_atom",
-    "composition", "elements", "hm_class",
+    "composition", "elements", "ratios", "hm_class", "Tc",
 ]
 
 
@@ -200,6 +207,7 @@ def build_lgbm_regression(n_estimators: int = 5000) -> lgb.LGBMRegressor:
         subsample=0.8,
         colsample_bytree=0.8,
         importance_type="gain",
+        verbose=-1,
         random_state=RANDOM_STATE,
     )
 
@@ -240,7 +248,7 @@ def build_lgbm_binary(n_estimators: int = 5000) -> lgb.LGBMClassifier:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_regression(task_name: str, cfg: dict) -> None:
-    df = pd.read_pickle(DATA_PATH)
+    df = pd.read_pickle(cfg["data_path"])
     print(f"\n  {len(df)} total samples")
 
     feats = load_features(task_name)

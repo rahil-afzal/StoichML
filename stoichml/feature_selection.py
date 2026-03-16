@@ -32,39 +32,41 @@ MAJORITY_CAP = 3000
 
 TARGETS = {
     "enthalpy": {
-        "col":  "enthalpy_formation_atom",
-        "task": "regression",
+        "input": "data/data_feat.pkl",
+        "col":   "enthalpy_formation_atom",
+        "task":  "regression",
     },
     "egap": {
+        "input":  "data/data_feat.pkl",
         "col":    "Egap",
         "task":   "regression",
         "log":    True,
-        # Train and select features on insulators only (Egap > 0).
-        # Including metals (Egap = 0) forces the model to learn zero-vs-nonzero
-        # discrimination — that is egap_type's job. Filtering here ensures
-        # feature importances reflect what drives gap magnitude, not what
-        # drives gap existence.
         "filter": ("Egap", ">", 0),
     },
     "egap_type": {
+        "input":           "data/data_feat.pkl",
         "col":             "Egap_type_numeric",
         "task":            "binary",
         "use_undersample": True,
         "minority_class":  1,
     },
     "hm_class": {
+        "input":           "data/data_feat.pkl",
         "col":             "hm_class",
         "task":            "multiclass",
         "use_undersample": True,
         "minority_class":  2,
-        # Capped undersampling — classes 0 and 1 drawn to MAJORITY_CAP,
-        # not down to class 2 size (strict 1:1:1 gives too few rows).
         "majority_cap":    MAJORITY_CAP,
     },
+    "supercon": {
+        "input": "data/supercon_feat.pkl",   # ← different file
+        "col":   "Tc",
+        "task":  "regression",
+    },
 }
-
 NON_FEATURE_COLS = [
     "compound",
+    "compounds",
     "spacegroup_relax",
     "Egap",
     "Egap_type",
@@ -73,6 +75,7 @@ NON_FEATURE_COLS = [
     "composition",
     "elements",
     "hm_class",
+    "Tc",
 ]
 
 PHYSICS_FEATURES = {
@@ -242,10 +245,11 @@ def lgbm_model(task: str, y: pd.Series, balanced: bool = False):
             learning_rate=0.05,
             max_depth=7,
             num_leaves=31,
-            min_data_in_leaf=30,
+            min_data_in_leaf=40,
             subsample=0.8,
             colsample_bytree=0.8,
             importance_type="gain",
+            verbose=-1,
             random_state=RANDOM_STATE,
         )
 
@@ -255,8 +259,10 @@ def lgbm_model(task: str, y: pd.Series, balanced: bool = False):
             learning_rate=0.05,
             max_depth=7,
             num_leaves=31,
+            min_data_in_leaf=40,
             class_weight=None if balanced else "balanced",
             importance_type="gain",
+            verbose=-1,
             random_state=RANDOM_STATE,
         )
 
@@ -415,18 +421,18 @@ def prune_features(
     selected  = set(imp[keep_mask].index)
 
     # Step 5 — force-retain physics features
-    available = {f for f in PHYSICS_FEATURES if f in imp.index}
-    missing   = {f for f in PHYSICS_FEATURES if f not in imp.index}
-    forced_in = available - selected
+    # available = {f for f in PHYSICS_FEATURES if f in imp.index}
+    # missing   = {f for f in PHYSICS_FEATURES if f not in imp.index}
+    # forced_in = available - selected
 
-    if forced_in:
-        print(f"  [{task_name}] Force-retained (below cumsum cutoff): "
-              f"{sorted(forced_in)}")
-    if missing:
-        print(f"  [{task_name}] Not found in X (check featurizer): "
-              f"{sorted(missing)}")
+    # if forced_in:
+    #     print(f"  [{task_name}] Force-retained (below cumsum cutoff): "
+    #           f"{sorted(forced_in)}")
+    # if missing:
+    #     print(f"  [{task_name}] Not found in X (check featurizer): "
+    #           f"{sorted(missing)}")
 
-    selected |= available
+    #selected |= available
 
     return sorted(selected)
 
@@ -435,13 +441,14 @@ def prune_features(
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_task(name: str, df: pd.DataFrame, results: dict) -> dict:
-    """Run feature pruning for a single task and return updated results dict."""
+def run_task(name: str, results: dict) -> dict:   # ← no df parameter
     cfg = TARGETS[name]
 
     print(f"\n{'═' * 55}")
     print(f"  Task: {name}")
     print(f"{'═' * 55}")
+
+    df = pd.read_pickle(cfg["input"])             # ← loads here
 
     y = df[cfg["col"]]
     X = df.drop(
@@ -466,19 +473,9 @@ if __name__ == "__main__":
         "--task",
         choices=list(TARGETS.keys()) + ["all"],
         default="all",
-        help=(
-            "Task to run feature selection for. "
-            "Choices: enthalpy | egap | egap_type | hm_class | all. "
-            "Default: all. "
-            "Running a single task updates only that entry in the JSON — "
-            "existing entries for other tasks are preserved."
-        ),
     )
     args = parser.parse_args()
 
-    df = pd.read_pickle(INPUT_PATH)
-
-    # Load existing results so a single-task run doesn't wipe other tasks
     os.makedirs(os.path.dirname(OUTPUT_JSON), exist_ok=True)
     if os.path.exists(OUTPUT_JSON):
         with open(OUTPUT_JSON) as f:
@@ -492,7 +489,7 @@ if __name__ == "__main__":
     tasks_to_run = list(TARGETS.keys()) if args.task == "all" else [args.task]
 
     for name in tasks_to_run:
-        results = run_task(name, df, results)
+        results = run_task(name, results)   # ← no df argument
 
     with open(OUTPUT_JSON, "w") as f:
         json.dump(results, f, indent=2)
