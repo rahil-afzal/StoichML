@@ -1,6 +1,6 @@
 # StoichML
 
-> **Stoichiometry-driven machine learning for inorganic materials property prediction — no crystal structure required.**
+> **Stoichiometry driven machine learning for inorganic materials property prediction; no crystal structure required.**
 
 StoichML predicts five materials properties directly from chemical composition using physics-informed elemental descriptors and gradient-boosted tree ensembles. It is designed for researchers who want interpretable, fast, and scalable screening of large composition spaces without DFT geometry as a prerequisite.
 
@@ -12,7 +12,7 @@ StoichML predicts five materials properties directly from chemical composition u
 
 Most ML models for materials properties require a relaxed crystal structure, limiting their use to compounds already computed by DFT. StoichML takes the opposite approach: given only a chemical formula, it simultaneously predicts formation enthalpy, band gap, metal/insulator character, half-metallic behaviour, and superconducting critical temperature.
 
-The primary scientific contribution of StoichML is not performance benchmarking but **quantification of the composition-only prediction ceiling** — a systematic characterisation of what stoichiometric features can and cannot predict, and why. SHAP attribution analysis across all five tasks recovers known physical mechanisms from composition alone without supervision, providing an interpretable map of composition-property relationships in inorganic materials space.
+The primary scientific contribution of StoichML is not performance benchmarking but **quantification of the composition-only prediction ceiling**  a systematic characterisation of what stoichiometric features can and cannot predict, and why. SHAP attribution analysis across all five tasks recovers known physical mechanisms from composition alone without supervision, providing an interpretable map of composition-property relationships in inorganic materials space.
 
 ---
 
@@ -38,7 +38,7 @@ The primary scientific contribution of StoichML is not performance benchmarking 
 | Band gap | Ensemble | 0.481 eV | 0.712 eV | 0.828 |
 | Tc | Ensemble | 3.796 K | 7.588 K | 0.930 |
 
-Band gap R² = 0.828 is a **hard composition-only ceiling** — six architecturally different models all converge to the same plateau with identical signed-residual bias patterns, confirming the missing information is structural (crystal symmetry, coordination geometry) rather than elemental. For Tc, global R² = 0.930 but within-bin R² = −2.26 across all Tc ranges, meaning the model has learned inter-family discrimination but cannot predict Tc variation within any compound family.
+Band gap R² = 0.828 is a **hard composition only ceiling** — six architecturally different models all converge to the same plateau with identical signed-residual bias patterns, confirming the missing information is structural (crystal symmetry, coordination geometry) rather than elemental. For Tc, global R² = 0.930 but within-bin R² = −2.26 across all Tc ranges, meaning the model has learned inter-family discrimination but cannot predict Tc variation within any compound family.
 
 ### Classification
 
@@ -180,7 +180,7 @@ StoichML/
 ## Installation
 
 ```bash
-git clone https://github.com/your-username/StoichML.git
+git clone https://github.com/rahil-afzal/StoichML
 cd StoichML
 
 conda create -n stoichml python
