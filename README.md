@@ -1,102 +1,178 @@
 # StoichML
 
-> **Stoichiometry-driven machine learning for materials property prediction — no crystal structure required.**
+> **Stoichiometry-driven machine learning for inorganic materials property prediction — no crystal structure required.**
 
-StoichML predicts materials properties directly from chemical composition using physics-informed elemental descriptors and gradient-boosted tree ensembles. It is designed for researchers who want interpretable, fast, and scalable screening of large composition spaces without DFT geometry as a prerequisite.
+StoichML predicts five materials properties directly from chemical composition using physics-informed elemental descriptors and gradient-boosted tree ensembles. It is designed for researchers who want interpretable, fast, and scalable screening of large composition spaces without DFT geometry as a prerequisite.
 
-**Built on:** [AFLOW](http://aflow.org) | **Models:** LightGBM + XGBoost | **Interpretability:** SHAP
+**Built on:** [AFLOW](http://aflow.org) + [supercon2018](https://github.com/vstanev1/Supercon) | **Models:** LightGBM + XGBoost | **Interpretability:** SHAP
 
 ---
 
 ## Motivation
 
-Most ML models for materials properties require a relaxed crystal structure — limiting their use to compounds already computed by DFT. StoichML takes the opposite approach: given only a chemical formula, it predicts whether a compound is a metal or insulator, estimates its band gap and formation enthalpy, and — its primary scientific target — identifies candidates for **half-metallic behaviour** relevant to spintronics and magnetoelectronics.
+Most ML models for materials properties require a relaxed crystal structure, limiting their use to compounds already computed by DFT. StoichML takes the opposite approach: given only a chemical formula, it simultaneously predicts formation enthalpy, band gap, metal/insulator character, half-metallic behaviour, and superconducting critical temperature.
 
-This makes StoichML practical for high-throughput screening of hypothetical compositions where no structural data exists.
+The primary scientific contribution of StoichML is not performance benchmarking but **quantification of the composition-only prediction ceiling** — a systematic characterisation of what stoichiometric features can and cannot predict, and why. SHAP attribution analysis across all five tasks recovers known physical mechanisms from composition alone without supervision, providing an interpretable map of composition-property relationships in inorganic materials space.
 
 ---
 
 ## Tasks
 
-| Task | Target | Type | Primary Metric |
+| Task | Target | Type | Dataset | N | Selected features |
+|---|---|---|---|---|---|
+| `enthalpy` | Formation enthalpy (eV/atom) | Regression | AFLOW | 50,493 | 34 |
+| `egap` | Band gap (eV) | Regression | AFLOW | 7,795 | 73 |
+| `egap_type` | Metal vs. insulator | Binary classification | AFLOW | 47,685 | 76 |
+| `hm_class` | Conductor / Insulator / Half-metal | Ternary classification | AFLOW | 50,493 | 30 |
+| `supercon` | Critical temperature Tc (K) | Regression | supercon2018 | 12,288 | 52 |
+
+---
+
+## Key Results
+
+### Regression
+
+| Task | Model | MAE | RMSE | R² |
+|---|---|---|---|---|
+| Enthalpy | Ensemble | 0.117 eV/atom | 0.186 eV/atom | 0.943 |
+| Band gap | Ensemble | 0.481 eV | 0.712 eV | 0.828 |
+| Tc | Ensemble | 3.796 K | 7.588 K | 0.930 |
+
+Band gap R² = 0.828 is a **hard composition-only ceiling** — six architecturally different models all converge to the same plateau with identical signed-residual bias patterns, confirming the missing information is structural (crystal symmetry, coordination geometry) rather than elemental. For Tc, global R² = 0.930 but within-bin R² = −2.26 across all Tc ranges, meaning the model has learned inter-family discrimination but cannot predict Tc variation within any compound family.
+
+### Classification
+
+| Task | ROC-AUC | Macro F1 | Balanced Acc |
 |---|---|---|---|
-| `enthalpy` | Formation enthalpy (eV/atom) | Regression | RMSE, MAE, R² |
-| `egap` | Band gap (eV) | Regression | RMSE, MAE, R² |
-| `egap_type` | Metal vs. insulator | Binary classification | ROC-AUC, PR-AUC |
-| `hm_class` | Conductor / Insulator / Half-metal | Multiclass classification | Macro F1, per-class F1 |
+| Metal/insulator | 0.994 | 0.928 | 0.970 |
+| Half-metal (one-shot) | — | 0.749 | — |
+| Half-metal (two-stage, F1-optimal) | — | **0.781** | 0.973 |
 
-The `hm_class` task is the core scientific contribution. Half-metals (class 2) are severely underrepresented in the AFLOW database — StoichML addresses this through class-weighted training and explicit monitoring of per-class recall across all CV folds.
+### Half-metal precision-recall comparison
 
----
+| Model | Precision | Recall | F1 |
+|---|---|---|---|
+| One-shot softmax (baseline) | 0.263 | 0.587 | 0.363 |
+| Two-stage (F1-optimal) | 0.288 | **1.000** | **0.447** |
+| Two-stage (precision-matched) | 0.263 | **1.000** | 0.416 |
 
-## Dataset
+At matched precision (P = 0.263), the two-stage architecture achieves recall = 1.000 vs the one-shot recall of 0.587 — a +70.6% absolute improvement. The two-stage PR curve strictly dominates the one-shot fixed operating point at every precision level.
 
-StoichML is trained and evaluated on data from the **AFLOW** database — one of the largest open repositories of high-throughput DFT calculations for inorganic compounds. AFLOW provides formation enthalpies, electronic band gaps, and space group symmetry data computed at a consistent DFT level (LDA/GGA).
+### SHAP cross-task attribution
 
-Electronic class labels (`hm_class`) are derived from the AFLOW band structure data:
-- **Class 0** — Conductor (metallic, zero gap)
-- **Class 1** — Insulator / semiconductor (finite gap, both spin channels)
-- **Class 2** — Half-metal (finite gap in one spin channel only)
+Each task is governed by a different physical descriptor family, recovered without supervision:
 
-Raw AFLOW data is not redistributed here. See [aflow.org](http://aflow.org) for access and the `data/` preparation scripts for the preprocessing pipeline applied before featurization.
-
----
-
-## Design philosophy
-
-### Composition-only representation
-No CIF file. No DFT geometry. No structure relaxation. Features are derived entirely from the element list and stoichiometric fractions. For a compound A_x B_y, the pipeline computes:
-
-1. Per-element property vectors (19 properties each)
-2. Weighted statistics over elements using stoichiometric fractions as weights
-3. Composition-level physics features encoding mixing, mismatch, and electronic character
-
-This representation is invariant to unit cell choice and scales to millions of hypothetical compounds in seconds.
-
-### Physics-informed, not just descriptor-heavy
-The feature set goes beyond standard MAGPIE descriptors. Key additions include:
-
-- **Valence d-electron count** restricted to the valence shell only (fixing overcounting for 4d/5d elements with filled 3d cores)
-- **Hund's rule unpaired electrons** — free-atom spin estimate, distinct from the solid-state magnetic moment
-- **Solid-state magnetic moment** (μB/atom from NIST/CRC) — reflects crystal-field quenching, relevant to half-metal classification
-- **Cohesive energy** — directly related to formation enthalpy via the Born-Haber cycle
-- **Chemical hardness** η = (I₁ − EA) / 2 in consistent eV units throughout
-- **f-block fraction** — distinguishes rare-earth magnetic compounds from d-block transition metals
-- **Configurational entropy** and **Δχ (electronegativity span)** — thermodynamic mixing and bond ionicity priors
-
-### Transparent by design
-All models use `importance_type="gain"` (average loss improvement per split) rather than the default split-count, which systematically underranks sparse physics features. SHAP values are computed for every task and model. The feature selection pipeline reports which physics features fall below the signal threshold, making the selection auditable.
+| Task | Dominant descriptor | Physical mechanism |
+|---|---|---|
+| Enthalpy | `chi_mad` (electronegativity MAD) | Ionic bonding stability |
+| Band gap | `period_hmean` (period number) | Orbital size and bandwidth |
+| Metal/insulator | `tm_frac` (TM fraction) | d-band occupation |
+| Half-metal | `Z_gmean` (atomic number) | Heavy TM identity |
+| Superconductivity | `volume_mad` (atomic volume MAD) | Lattice strain, phonon softening |
 
 ---
 
-## Project structure
+## Feature Engineering
+
+### Elemental property database
+
+22 elemental properties retrieved from `mendeleev`, supplemented with a literature patch table for 74 elements. Properties include:
+
+| Group | Properties |
+|---|---|
+| Identity | Z, atomic mass |
+| Electronic | χ (Pauling), I₁, EA, η = (I₁−EA)/2, valence count, vacancies, d-count (valence shell only), p-count, \|d−5\|, unpaired electrons |
+| Structural | covalent radius, atomic volume, dipole polarisability |
+| Thermodynamic | Tm, Tb, κ, Ecoh |
+| Magnetic | solid-state magnetic moment |
+| New in this work | work function φ, period number |
+
+### Statistical aggregation
+
+For each property, 8 weighted statistics are computed using stoichiometric fractions as weights: `mean`, `std`, `min`, `max`, `mad`, `pos` = (mean−min)/(max−min), `hmean` (harmonic), `gmean` (geometric). This yields **22 × 8 = 176** elemental statistics.
+
+### Composition-level physics features
+
+18 additional features encode composition-level structure not reducible to single-element statistics: stoichiometric complexity (n_elements, n_atoms, max_weight, conf_entropy), electronegativity mismatch (chi_mad, delta_chi, pair_chi), orbital character (S_orb), magnetic character (S_mag, tm_frac, f_frac, unpaired_mean, unpaired_var), and structural mismatch (r_mad, mass_std, val_mean, val_var).
+
+**Total: 176 + 18 = 194 features.**
+
+### Feature selection
+
+Task-specific feature subsets are selected by LightGBM cumulative gain importance (threshold τ = 0.85, 5-fold CV). For imbalanced tasks (egap_type, hm_class), importances are averaged across 5 folds × 5 seeds = 25 undersampled training runs. Physics feature force-retention is **disabled** — all features survive on predictive merit alone.
+
+---
+
+## Architecture
+
+### Regression tasks (enthalpy, egap, supercon)
+
+- LightGBM + XGBoost, 5-fold KFold CV with early stopping (patience = 200)
+- Final model n_estimators set to mean best iteration across CV folds
+- Ensemble = (LGBM prediction + XGB prediction) / 2
+
+### Binary classification (egap_type)
+
+- 5-seed LGBM ensemble, strict 1:1 undersampling per seed
+- Youden-J threshold tuned on OOF ensemble probabilities
+
+### Ternary classification (hm_class) — two-stage
+
+**Stage 1 — half-metal detector (binary):**
+- 5-seed LGBM + XGBoost ensemble, strict 1:1 undersampling (661 half-metals)
+- Three thresholds evaluated from OOF probabilities:
+  - Youden-J (balanced sensitivity/specificity)
+  - F1-optimal (maximises half-metal F1)
+  - Precision-matched (matches one-shot baseline precision)
+
+**Stage 2 — conductor/insulator (binary):**
+- Standard 5-fold CV LGBM + XGBoost on non-half-metal samples
+- No undersampling needed (ratio ≈ 6:1, manageable)
+
+**Inference:** if stage 1 probability ≥ threshold → class 2 (half-metal); else → stage 2 prediction (class 0 or 1).
+
+---
+
+## Project Structure
 
 ```
 StoichML/
 │
 ├── stoichml/
-│   └── featurizer.py             # core featurizer — vec(), stats(), phys()
-
+│   ├── feature_selection.py       # cumulative gain importance pruning
+│   ├── utils.py 
+│   └── featurizer.py              # vec(), stats(), phys() — 194 features
 │
 ├── scripts/
-│   ├── model_train.py            # training pipeline (--task flag)
-│   ├── feature_pruning_lgbm.py   # CV-based feature selection per task
-│   └── property_audit.py         # elemental property coverage audit
+│   ├── run_featurize.py           # featurize AFLOW and supercon datasets
+
+│   ├── model_train.py             # enthalpy + egap_type training
+│   ├── model_egap.py              # band gap full benchmark (6 models)
+│   ├── model_supercon.py          # Tc regression + variance decomposition
+│   ├── train_hm.py                # one-shot vs two-stage comparison
+│   ├── shap_supercon.py           # SHAP for Superconductivity
+│   └── shap.py                    # unified SHAP for all 5 tasks
 │
 ├── data/
-│   ├── data_feat.pkl             # featurized dataset (generated)
-│   └── selected_features.json   # pruned feature sets per task (generated)
+│   ├── dataset.pkl                # raw AFLOW data
+│   ├── superconductivity.pkl      # raw supercon2018 data
+│   ├── data_feat.pkl              # featurized AFLOW (generated)
+│   ├── supercon_feat.pkl          # featurized supercon (generated)
+│   └── selected_features.json     # pruned feature sets per task (generated)
 │
 ├── models/
 │   └── {task}/
 │       ├── {task}_lgbm.pkl
 │       ├── {task}_xgb.pkl
 │       ├── {task}_metrics.json
-│       └── {task}_thresholds.json    # binary tasks only
+│       └── thresholds.json        # classification tasks
 │
 └── shap_outputs/
     └── {task}/
-        └── *.png
+        ├── shap_summary_{task}.png
+        ├── shap_bar_{task}.png
+        ├── shap_dependence_*_{task}.png
+        └── feature_importance_{task}.csv
 ```
 
 ---
@@ -124,167 +200,129 @@ lightgbm
 xgboost
 shap
 joblib
-tabulate         # property audit script
+matplotlib
+seaborn
+pymatgen         
 ```
 
 ---
 
 ## Quickstart
 
-
-
-### 1. Featurize your dataset
+### 1. Prepare your data
 
 Your input DataFrame needs two columns:
 - `elements` — list of element symbols, e.g. `["Fe", "O"]`
-- `composition` — list of stoichiometric counts in **reduced form**, e.g. `[2, 3]` for Fe₂O₃
+- `composition` — list of stoichiometric counts in reduced form, e.g. `[2, 3]` for Fe₂O₃
+
+For the other dataset, parse from formula strings using pymatgen:
+
+```python
+from pymatgen.core import Composition
+import pandas as pd
+
+df = pd.read_csv("your_file.csv")
+df["composition_obj"] = df["formula"].apply(Composition)
+df["elements"] = df["composition_obj"].apply(lambda c: [str(el) for el in c.elements])
+df["composition"] = df["composition_obj"].apply(lambda c: [c[el] for el in c.elements])
+```
+
+### 2. Featurize
 
 ```python
 from stoichml.featurizer import featurize
-import pandas as pd
 
-df = pd.DataFrame({
-    "elements":    [["Fe", "O"],  ["Co", "Mn", "O"]],
-    "composition": [[2, 3],       [1, 1, 2]],
-})
-
-df_feat = featurize(df)
-# → original columns + 110 feature columns per row
+df_feat = featurize(df, elements_col="elements", composition_col="composition")
+# → original columns + 194 feature columns
 ```
 
-**Feature count breakdown:**
-- 19 elemental properties × 5 weighted statistics = **95 elemental features**
-- 15 composition-level physics features
-- **110 total**
-
-> ⚠️ `n_atoms` is convention-dependent. Provide compositions in lowest integer ratios (Fe₂O₃ not Fe₄O₆). AFLOW data is already reduced.
-
-### 2. Run feature pruning
-
-Selects the minimal feature set per task using 5-fold CV-averaged gain importances. Physics features are **force-retained** regardless of importance score — domain knowledge takes precedence over data-driven pruning for features with explicit physical justification.
+Or via script (handles both datasets):
 
 ```bash
-python -m scripts.feature_selection
-# → writes data/selected_features.json
+python -m scripts.run_featurize                   # both datasets
+python -m scripts.run_featurize --task aflow
+python -m scripts.run_featurize --task supercon
 ```
 
-The pruning script reports which physics features fall below the signal threshold per task, making the selection auditable.
+### 3. Feature selection
+
+```bash
+python -m scripts.feature_selection               # all 5 tasks
+python -m scripts.feature_selection --task supercon
+```
+
+Writes `data/selected_features.json` with per-task feature lists.
 
 ### 4. Train
 
 ```bash
 python -m scripts.model_train --task enthalpy
 python -m scripts.model_train --task egap_type
-python -m scripts.model_egap
-python -m scripts.model_hm 
+python -m scripts.model_egap                      # 6-model band gap benchmark
+python -m scripts.model_supercon                  # Tc + variance decomposition
+python -m scripts.train_hm_class                  # one-shot vs two-stage
 ```
 
-Each run:
-- Trains LightGBM and XGBoost in parallel
-- Runs 5-fold stratified cross-validation with early stopping (patience = 200)
-- Reports per-fold metrics including **per-class F1 for `hm_class`** — macro F1 alone does not reveal whether half-metals are ever predicted
-- Determines optimal classification threshold from OOF probabilities (binary tasks) — unbiased, not per-fold
-- Sets final model `n_estimators` to the mean best iteration across CV folds
-- Saves models, metrics, and thresholds to `models/{task}/`
+### 5. SHAP analysis
+
+```bash
+python -m scripts.shap_analysis --task all
+python -m scripts.shap_analysis --task supercon   # includes per-bin analysis
+```
 
 ---
 
-## Feature reference
+## Reproducing the paper results
 
-### Elemental properties
+Run scripts in this order:
 
-For each property, five statistics are computed using stoichiometric fractions as weights: `mean`, `std`, `min`, `max`, `mad` (weighted mean absolute deviation), and `pos` = (mean − min) / (max − min).
+```bash
+# Step 1 — featurize
+python -m scripts.run_featurize
 
-> `rng` (= max − min) is intentionally excluded — it is fully determined by `min` and `max` and carries no additional information.
+# Step 2 — feature selection
+python -m scripts.feature_selection
 
-| Property | Symbol | Unit | Notes |
-|---|---|---|---|
-| Atomic number | `Z` | — | |
-| Atomic mass | `mass` | u | |
-| Pauling electronegativity | `chi` | — | Noble gases set to 0 |
-| Covalent / atomic radius | `radius` | pm | |
-| Atomic volume | `volume` | cm³/mol | |
-| Dipole polarizability | `polar` | Bohr³ | |
-| Chemical hardness | `hard` | eV | η = (I₁ − EA)/2 |
-| Valence electron count | `val` | — | |
-| Valence shell vacancies | `vac` | — | |
-| Valence d-electron count | `dcount` | — | Valence shell only (n = nmax−1) |
-| d-shell half-filling distance | `dhalf` | — | \|dcnt − 5\| |
-| Unpaired electrons | `unpaired` | — | Hund's rule free-atom estimate |
-| Electron affinity | `EA` | eV | Unstable anions set to 0 |
-| First ionisation energy | `I1` | eV | |
-| Melting point | `Tm` | K | Stable allotrope at STP |
-| Boiling point | `Tb` | K | |
-| Thermal conductivity | `kappa` | W/(m·K) | |
-| Cohesive energy | `Ecoh` | kJ/mol | Born-Haber elemental reference |
-| Solid-state magnetic moment | `magmom` | μB/atom | Non-magnetic elements set to 0 |
+# Step 3 — train all tasks
+python -m scripts.model_train --task enthalpy
+python -m scripts.model_train --task egap_type
+python -m scripts.model_egap
+python -m scripts.model_supercon --no_log
+python -m scripts.train_hm_class
 
-### Composition-level physics features
+# Step 4 — SHAP
+python -m scripts.shap --task all
+```
 
-| Feature | Physical meaning | Primary task |
-|---|---|---|
-| `n_elements` | Number of distinct species | All |
-| `n_atoms` | Total atoms per formula unit | `enthalpy` |
-| `max_weight` | Stoichiometric fraction of majority element | All |
-| `conf_entropy` | Configurational mixing entropy | All |
-| `chi_mad` | Weighted electronegativity mismatch | `egap`, `egap_type` |
-| `delta_chi` | Electronegativity span max−min (Phillips ionicity) | `egap`, `egap_type` |
-| `r_mad` | Atomic size mismatch (lattice strain proxy) | `enthalpy` |
-| `mass_std` | Mass dispersion | `enthalpy`, `hm_class` |
-| `val_mean` | Weighted mean valence electron count | All |
-| `val_var` | Valence electron dispersion | All |
-| `dhalf_mean` | Mean d-shell half-filling distance | `hm_class` |
-| `tm_frac` | d-block (transition metal) fraction | `egap`, `hm_class` |
-| `f_frac` | f-block (lanthanide / actinide) fraction | `hm_class` |
-| `unpaired_mean` | Mean unpaired electrons | `hm_class` |
-| `unpaired_var` | Unpaired electron dispersion | `hm_class` |
+All metrics are saved as JSON files in `models/{task}/`. Figures are saved in `models/{task}/images/` and `shap_outputs/{task}/`.
 
 ---
 
-## Training details
+## Known Limitations
 
-| Setting | Value |
-|---|---|
-| CV strategy | 5-fold StratifiedKFold (classification) / KFold (regression) |
-| Early stopping patience | 200 rounds |
-| Final `n_estimators` | Mean best iteration across CV folds |
-| Importance type | `gain` (LightGBM + XGBoost) |
-| Binary threshold | Youden-J optimised on OOF probabilities |
-| Imbalance — binary | Balanced class weights |
-| Imbalance — multiclass | Manual weights: conductor ×1, insulator ×1, half-metal ×8 |
-| XGBoost multiclass weighting | `sample_weight` per fold and final fit |
-| Band gap transform | log1p (clipped at 0 before transform) |
+**Composition-only ceiling.** Crystal symmetry and local coordination geometry are absent. Band gap prediction plateaus at R² = 0.828 regardless of model architecture. Tc prediction within compound families has R² < 0 across all Tc ranges — the model learns inter-family discrimination but not intra-family variation.
+
+**Half-metal class imbalance.** Half-metals are rare (661 / 50,493 = 1.3%). The two-stage architecture substantially improves recall but precision remains limited by the rarity of the class.
+
+**Formula unit convention.** `n_atoms` requires reduced compositions. Non-reduced inputs give inconsistent values. AFLOW data satisfies this by default; other sources should be normalised before featurisation.
+
+**DFT target bias.** GGA-PBE systematically underestimates band gaps by ~30–50%. Models learn to reproduce DFT values; comparisons with experiment should account for this offset.
 
 ---
 
-## Known limitations
+## Citation
 
-**No structural awareness.** Topology-dependent phenomena — local bonding geometry, magnetic ordering, and Fermi surface topology — cannot be captured from composition alone. This sets an inherent precision ceiling, particularly for formation energy and spin-dependent properties.
+If you use StoichML in your research, please cite:
 
-**Half-metal class imbalance.** Half-metals (class 2) are rare in the AFLOW database. Class weighting partially compensates but high-recall detection of class 2 remains challenging. Future work may explore SMOTE, physics-guided synthetic augmentation, or retrieval-augmented approaches.
-
-**Formula unit convention.** `n_atoms` requires reduced compositions. Non-reduced inputs give inconsistent values. AFLOW data satisfies this by default.
-
-**Exotic elements.** Superheavy elements (Z ≥ 104) and heavy transuranics are missing 5–7 properties in mendeleev. These elements should not appear in real AFLOW materials datasets; if they do, the missingness signal is informative rather than noise.
-
----
-
-## How StoichML compares
-
-| Framework | Representation | Model | Interpretability |
-|---|---|---|---|
-| MAGPIE | Composition descriptors | Various | Partial |
-| CrabNet | Composition + attention | Transformer | Low |
-| ElemNet | Composition | Deep NN | Low |
-| **StoichML** | **Extended physics descriptors** | **LGBM + XGB** | **SHAP, full** |
-
-StoichML's distinguishing features are extended physics-informed descriptors beyond MAGPIE, explicit half-metal classification as a primary task, and a fully integrated SHAP interpretability pipeline across all four tasks.
-
----
-
-## Contributing
-
-Contributions, issues, and feature requests are welcome. If you use StoichML on a dataset other than AFLOW, please open an issue reporting which elements caused missing-property failures — this helps improve the patch table.
+```bibtex
+@article{stoichml2025,
+  author  = {TODO},
+  title   = {What Stoichiometry Can and Cannot Predict: Composition-Only
+             Machine Learning for Inorganic Materials},
+  journal = {TODO},
+  year    = {2025},
+}
+```
 
 ---
 
