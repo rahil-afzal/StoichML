@@ -183,7 +183,7 @@ StoichML/
 git clone https://github.com/your-username/StoichML.git
 cd StoichML
 
-conda create -n stoichml python=3.11
+conda create -n stoichml python
 conda activate stoichml
 
 pip install -r requirements.txt
@@ -266,8 +266,8 @@ python -m scripts.train_hm_class                  # one-shot vs two-stage
 ### 5. SHAP analysis
 
 ```bash
-python -m scripts.shap_analysis --task all
-python -m scripts.shap_analysis --task supercon   # includes per-bin analysis
+python -m scripts.shap --task all
+python -m scripts.shap --task supercon   # includes per-bin analysis
 ```
 
 ---
@@ -288,7 +288,7 @@ python -m scripts.model_train --task enthalpy
 python -m scripts.model_train --task egap_type
 python -m scripts.model_egap
 python -m scripts.model_supercon --no_log
-python -m scripts.train_hm_class
+python -m scripts.train_hm
 
 # Step 4 — SHAP
 python -m scripts.shap --task all
