@@ -88,13 +88,7 @@ TASKS = {
             for s in UNDERSAMPLE_SEEDS
         ],
         "shap_class":   1,                 # class 1 = half-metal
-    },
-    "supercon": {
-    "type":         "regression",
-    "features_key": "supercon",
-    "data_path":    "data/supercon_feat.pkl",
-    "model_paths":  lambda: [os.path.join(MODEL_DIR, "supercon", "supercon_lgbm.pkl")],
-    },
+    }
 }
 
 
