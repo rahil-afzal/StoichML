@@ -527,7 +527,7 @@ def parse_args() -> argparse.Namespace:
         description="Superconductivity Tc regression — StoichML.",
     )
     p.add_argument("--tc_filter", type=float, default=0.1,
-                   help="Min Tc threshold in K (default: 0 → Tc > 0)")
+                   help="Min Tc threshold in K (default: 0.1 → Tc > 0.1)")
     p.add_argument("--no_log", action="store_true",
                    help="Disable log1p transform of Tc (default: use log1p)")
     return p.parse_args()

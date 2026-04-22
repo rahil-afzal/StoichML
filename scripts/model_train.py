@@ -69,12 +69,6 @@ TASKS = {
         "minority_class": 1,
         "data_path":      "data/data_feat.pkl",
     },
-    "supercon": {
-        "type":      "regression",
-        "target":    "Tc",
-        "transform": None,
-        "data_path": "data/supercon_feat.pkl",   # ← different file
-    },
 }
 NON_FEATURE_COLS = [
     "compound", "compounds", "spacegroup_relax", "Egap", "Egap_type",

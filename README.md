@@ -46,17 +46,23 @@ Band gap R² = 0.828 is a **hard composition only ceiling** — six architectura
 |---|---|---|---|
 | Metal/insulator | 0.994 | 0.928 | 0.970 |
 | Half-metal (one-shot) | — | 0.749 | — |
-| Half-metal (two-stage, F1-optimal) | — | **0.781** | 0.973 |
+| Half-metal (two-stage, F1-optimal) | — | **0.952** | — |
 
 ### Half-metal precision-recall comparison
 
-| Model | Precision | Recall | F1 |
-|---|---|---|---|
-| One-shot softmax (baseline) | 0.263 | 0.587 | 0.363 |
-| Two-stage (F1-optimal) | 0.288 | **1.000** | **0.447** |
-| Two-stage (precision-matched) | 0.263 | **1.000** | 0.416 |
+| Model | Threshold | Precision | Recall | F1 |
+|---|---|---|---|---|
+| One-shot softmax (baseline) | — | 0.263 | 0.587 | 0.363 |
+| Two-stage (Youden-J) | 0.595 | 0.104 | **0.861** | 0.185 |
+| Two-stage (F1-optimal) | 0.931 | **0.288** | 0.446 | **0.350** |
+| Two-stage (precision-matched) | 0.913 | 0.263 | 0.511 | 0.347 |
 
-At matched precision (P = 0.263), the two-stage architecture achieves recall = 1.000 vs the one-shot recall of 0.587 — a +70.6% absolute improvement. The two-stage PR curve strictly dominates the one-shot fixed operating point at every precision level.
+The primary gain of the two-stage architecture is in recall, not F1.
+At the Youden-J threshold the two-stage achieves recall = 0.861 vs
+the one-shot recall of 0.587; a +27.4% absolute improvement.
+Unlike the one-shot softmax, which is a fixed operating point,
+the two-stage exposes a tunable precision-recall curve:
+stage 1 ROC-AUC = 0.940, PR-AUC = 0.274.
 
 ### SHAP cross-task attribution
 
@@ -140,7 +146,7 @@ StoichML/
 │
 ├── stoichml/
 │   ├── feature_selection.py       # cumulative gain importance pruning
-│   ├── utils.py 
+│   ├── utils.py                   # load and featurize the dataset
 │   └── featurizer.py              # vec(), stats(), phys() — 194 features
 │
 ├── scripts/
@@ -320,7 +326,7 @@ If you use StoichML in your research, please cite:
   title   = {What Stoichiometry Can and Cannot Predict: Composition-Only
              Machine Learning for Inorganic Materials},
   journal = {TODO},
-  year    = {2025},
+  year    = {2026},
 }
 ```
 

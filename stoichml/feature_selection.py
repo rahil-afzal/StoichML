@@ -76,41 +76,8 @@ NON_FEATURE_COLS = [
     "elements",
     "hm_class",
     "Tc",
+    "stoichiometry"
 ]
-
-PHYSICS_FEATURES = {
-    # ── Stoichiometric structure ──────────────────────────────────────────
-    "n_elements",
-    "n_atoms",
-    "max_weight",
-
-    # ── Entropy features ──────────────────────────────────────────────────
-    "conf_entropy",
-    "S_mag",
-    "S_orb",
-
-    # ── Electronegativity mismatch ────────────────────────────────────────
-    "chi_mad",
-    "delta_chi",
-    "pair_chi",
-
-    # ── Structural mismatch ───────────────────────────────────────────────
-    "r_mad",
-    "mass_std",
-
-    # ── Valence electron structure ────────────────────────────────────────
-    "val_mean",
-    "val_var",
-
-    # ── d/f shell character ───────────────────────────────────────────────
-    "dhalf_mean",
-    "tm_frac",
-    "f_frac",
-
-    # ── Magnetic features ─────────────────────────────────────────────────
-    "unpaired_mean",
-    "unpaired_var",
-}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
