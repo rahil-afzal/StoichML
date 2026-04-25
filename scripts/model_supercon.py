@@ -49,6 +49,14 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold
 
 matplotlib.use("Agg")
+# Source - https://stackoverflow.com/a/71692086
+# Posted by Gabriele
+# Retrieved 2026-04-23, License - CC BY-SA 4.0
+
+plt.rcParams["font.family"] = "serif"
+plt.rcParams["font.serif"] = ["Times New Roman"]
+
+matplotlib.rcParams.update({'font.size': 17})
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -449,7 +457,7 @@ def plot_diagnostics(
 
     plt.tight_layout()
     path = IMG_DIR / "diagnostics.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved → {path}")
 

@@ -3,56 +3,37 @@
 """
 train_hm_class.py
 ─────────────────
-StoichML training pipeline — hm_class.
+StoichML — hm_class: One-shot ternary vs binary half-metal classifier.
 
-Two approaches trained and compared in one run:
+Approach 1  One-shot ternary (baseline)
+            Conductor / Insulator / Half-metal (3 classes)
+            5-seed capped undersampling (majority classes capped at 3000)
+            LGBM + XGBoost ensemble, softmax argmax at inference
+            Single fixed operating point in precision-recall space
 
-  Approach 1  One-shot three-class (baseline)
-              Direct multiclass: conductor / insulator / half-metal
-              5-seed capped undersampling (classes 0+1 capped at 3000)
-              LGBM + XGBoost ensemble, softmax argmax at inference
-              Single operating point in precision-recall space
-
-  Approach 2  Two-stage (proposed)
-              Stage 1: half-metal vs not (5-seed 1:1 undersampling,
-                       LGBM + XGBoost, tunable threshold)
-              Stage 2: conductor vs insulator (5-fold CV, LGBM + XGBoost)
-              Evaluated at three thresholds:
-                - Youden-J       (balanced sensitivity/specificity)
-                - F1-optimal     (maximises half-metal F1)
-                - Precision-matched (P >= one-shot precision for fair
-                                    recall comparison)
-
-Comparison framing:
-  The one-shot is a single fixed point in precision-recall space.
-  The two-stage is a tunable curve.
-  The publishable claim: two-stage achieves strictly higher recall
-  than one-shot at matched precision — confirmed by comparison_pr_curve.png.
+Approach 2  Binary half-metal detector
+            Half-metal (1) vs not (0)
+            5-seed strict 1:1 undersampling
+            LGBM + XGBoost ensemble, tunable threshold
+            Three operating points:
+              Youden-J, F1-optimal, Precision-matched
 
 Outputs  models/hm_class/
   oneshot_lgbm_seed{s}.pkl  x5
   oneshot_xgb_seed{s}.pkl   x5
-  stage1_lgbm_seed{s}.pkl   x5
-  stage1_xgb_seed{s}.pkl    x5
-  stage2_lgbm.pkl
-  stage2_xgb.pkl
+  binary_lgbm_seed{s}.pkl   x5
+  binary_xgb_seed{s}.pkl    x5
   thresholds.json
   oneshot_metrics.json
-  stage1_metrics.json
-  stage2_metrics.json
+  binary_metrics.json
   hm_class_metrics.json
   images/
     oneshot_confusion.png
-    stage1_roc_pr.png
-    stage1_threshold_sweep.png
-    stage1_confusion.png
-    stage2_roc_pr.png
-    stage2_confusion.png
-    final_confusion_Youden-J.png
-    final_confusion_F1-optimal.png
-    final_confusion_Precision-matched.png
-    feature_importance_stage1.png
-    feature_importance_stage2.png
+    binary_roc_pr.png
+    binary_threshold_sweep.png
+    binary_confusion_youden.png
+    feature_importance_oneshot.png
+    feature_importance_binary.png
     comparison_pr_curve.png
     comparison_bar.png
 
@@ -60,48 +41,47 @@ Usage:
     python -m scripts.model_hm
 """
 
+from __future__ import annotations
+
 import json
 import os
+
 import joblib
-import numpy as np
-import pandas as pd
+import lightgbm as lgb
 import matplotlib
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import numpy as np
+import pandas as pd
 import seaborn as sns
-
-from sklearn.model_selection import StratifiedKFold
+import xgboost as xgb
 from sklearn.metrics import (
-    f1_score,
-    balanced_accuracy_score,
-    roc_auc_score,
     average_precision_score,
-    roc_curve,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
     precision_recall_curve,
     precision_recall_fscore_support,
-    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
 )
-
-import lightgbm as lgb
-import xgboost as xgb
+from sklearn.model_selection import StratifiedKFold
 
 matplotlib.use("Agg")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-RANDOM_STATE = 42
-N_SPLITS     = 5
-MAJORITY_CAP = 3000
-
-DATA_PATH     = "data/data_feat.pkl"
-FEATURES_JSON = "data/selected_features.json"
-OUT_DIR       = "models/hm_class"
-IMG_DIR       = os.path.join(OUT_DIR, "images")
-
+RANDOM_STATE      = 42
+N_SPLITS          = 5
+MAJORITY_CAP      = 3000
+DATA_PATH         = "data/data_feat.pkl"
+FEATURES_JSON     = "data/selected_features.json"
+OUT_DIR           = "models/hm_class"
+IMG_DIR           = os.path.join(OUT_DIR, "images")
 UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
+CLASS_NAMES       = {0: "Conductor", 1: "Insulator", 2: "Half-metal"}
 
 NON_FEATURE_COLS = [
     "compound", "spacegroup_relax", "Egap", "Egap_type",
@@ -109,7 +89,19 @@ NON_FEATURE_COLS = [
     "composition", "elements", "hm_class",
 ]
 
-CLASS_NAMES = {0: "Conductor", 1: "Insulator", 2: "Half-metal"}
+# ── Matplotlib style ─────────────────────────────────────────────────────────
+plt.rcParams.update({
+    "font.family":       "Times New Roman",
+    "font.size":         11,
+    "axes.titlesize":    12,
+    "axes.labelsize":    11,
+    "xtick.labelsize":   10,
+    "ytick.labelsize":   10,
+    "legend.fontsize":   9,
+    "figure.dpi":        300,
+    "savefig.dpi":       300,
+})
+SAVEFIG_KW = dict(dpi=300, bbox_inches="tight")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -121,22 +113,8 @@ def load_features() -> list[str]:
         feats = json.load(f)
     task_feats = feats.get("hm_class", [])
     if not task_feats:
-        raise ValueError(
-            f"No features found for 'hm_class' in {FEATURES_JSON}. "
-            "Run feature_selection.py first."
-        )
+        raise ValueError(f"No features for 'hm_class' in {FEATURES_JSON}.")
     return task_feats
-
-
-def summarize(metric_list: list[dict]) -> dict:
-    keys = metric_list[0].keys()
-    return {
-        k: {
-            "mean": float(np.mean([m[k] for m in metric_list])),
-            "std":  float(np.std( [m[k] for m in metric_list])),
-        }
-        for k in keys
-    }
 
 
 def save_json(obj: dict, path: str) -> None:
@@ -145,41 +123,13 @@ def save_json(obj: dict, path: str) -> None:
         json.dump(obj, f, indent=4)
 
 
-def oof_best_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
-    """Youden-J optimal threshold."""
-    fpr, tpr, thr = roc_curve(y_true, prob)
-    return float(thr[np.argmax(tpr - fpr)])
-
-
-def f1_optimal_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
-    """Threshold that maximises F1 for the positive class."""
-    thresholds = np.linspace(0.01, 0.99, 500)
-    best_f1, best_thr = 0.0, 0.5
-    for t in thresholds:
-        pred = (prob >= t).astype(int)
-        f1 = f1_score(y_true, pred, pos_label=1, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thr = t
-    return float(best_thr)
-
-
-def precision_matched_threshold(
-    y_true: np.ndarray,
-    prob: np.ndarray,
-    target_precision: float,
-) -> float:
-    """
-    Find the highest threshold where precision >= target_precision.
-    Used to match the one-shot precision for a fair recall comparison.
-    At matched precision, higher recall = better — that is the claim.
-    """
-    prec, rec, thr = precision_recall_curve(y_true, prob)
-    # prec/rec length = n_thresholds + 1; thr length = n_thresholds
-    valid = prec[:-1] >= target_precision
-    if not valid.any():
-        return float(thr[-1])
-    return float(thr[valid][0])
+def summarize(metric_list: list[dict]) -> dict:
+    keys = metric_list[0].keys()
+    return {
+        k: {"mean": float(np.mean([m[k] for m in metric_list])),
+            "std":  float(np.std( [m[k] for m in metric_list]))}
+        for k in keys
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -188,8 +138,8 @@ def precision_matched_threshold(
 
 def binary_metrics(
     y_true: np.ndarray,
-    prob: np.ndarray,
-    thr: float,
+    prob:   np.ndarray,
+    thr:    float,
 ) -> dict:
     pred = (prob >= thr).astype(int)
     p, r, f, _ = precision_recall_fscore_support(
@@ -235,51 +185,77 @@ def three_class_metrics(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# THRESHOLD SELECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def youden_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
+    fpr, tpr, thr = roc_curve(y_true, prob)
+    return float(thr[np.argmax(tpr - fpr)])
+
+
+def f1_optimal_threshold(y_true: np.ndarray, prob: np.ndarray) -> float:
+    thresholds = np.linspace(0.01, 0.99, 500)
+    best_f1, best_thr = 0.0, 0.5
+    for t in thresholds:
+        f1 = f1_score(y_true, (prob >= t).astype(int),
+                      pos_label=1, zero_division=0)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, t
+    return float(best_thr)
+
+
+def precision_matched_threshold(
+    y_true:           np.ndarray,
+    prob:             np.ndarray,
+    target_precision: float,
+) -> float:
+    prec, _, thr = precision_recall_curve(y_true, prob)
+    valid = prec[:-1] >= target_precision
+    return float(thr[valid][0]) if valid.any() else float(thr[-1])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # UNDERSAMPLING
 # ══════════════════════════════════════════════════════════════════════════════
 
 def undersample_strict(
-    X: pd.DataFrame,
-    y: pd.Series,
-    minority_class: int,
-    seed: int,
+    X: pd.DataFrame, y: pd.Series,
+    minority_class: int, seed: int,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Strict 1:1 — must match feature_selection.py."""
-    rng          = np.random.default_rng(seed)
-    idx_minority = y[y == minority_class].index
-    n_minority   = len(idx_minority)
-    balanced_idx = list(idx_minority)
+    rng     = np.random.default_rng(seed)
+    idx_min = list(y[y == minority_class].index)
+    n_min   = len(idx_min)
+    all_idx = list(idx_min)
     for cls in sorted(y.unique()):
         if cls == minority_class:
             continue
-        idx_cls  = y[y == cls].index
-        n_sample = min(n_minority, len(idx_cls))
-        balanced_idx.extend(rng.choice(idx_cls, size=n_sample, replace=False))
-    balanced_idx = np.array(balanced_idx)
-    rng.shuffle(balanced_idx)
-    return X.loc[balanced_idx], y.loc[balanced_idx]
+        idx_cls = y[y == cls].index
+        all_idx.extend(
+            rng.choice(idx_cls, size=min(n_min, len(idx_cls)), replace=False)
+        )
+    all_idx = np.array(all_idx)
+    rng.shuffle(all_idx)
+    return X.loc[all_idx], y.loc[all_idx]
 
 
 def undersample_capped(
-    X: pd.DataFrame,
-    y: pd.Series,
-    minority_class: int,
-    majority_cap: int,
-    seed: int,
+    X: pd.DataFrame, y: pd.Series,
+    minority_class: int, majority_cap: int, seed: int,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Capped undersampling for one-shot multiclass."""
-    rng          = np.random.default_rng(seed)
-    idx_minority = y[y == minority_class].index
-    balanced_idx = list(idx_minority)
+    rng     = np.random.default_rng(seed)
+    idx_min = list(y[y == minority_class].index)
+    all_idx = list(idx_min)
     for cls in sorted(y.unique()):
         if cls == minority_class:
             continue
-        idx_cls  = y[y == cls].index
-        n_sample = min(majority_cap, len(idx_cls))
-        balanced_idx.extend(rng.choice(idx_cls, size=n_sample, replace=False))
-    balanced_idx = np.array(balanced_idx)
-    rng.shuffle(balanced_idx)
-    return X.loc[balanced_idx], y.loc[balanced_idx]
+        idx_cls = y[y == cls].index
+        all_idx.extend(
+            rng.choice(idx_cls,
+                       size=min(majority_cap, len(idx_cls)), replace=False)
+        )
+    all_idx = np.array(all_idx)
+    rng.shuffle(all_idx)
+    return X.loc[all_idx], y.loc[all_idx]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -288,8 +264,7 @@ def undersample_capped(
 
 def build_lgbm_binary(n_estimators: int = 5000) -> lgb.LGBMClassifier:
     return lgb.LGBMClassifier(
-        objective="binary",
-        learning_rate=0.05, num_leaves=64,
+        objective="binary", learning_rate=0.05, num_leaves=64,
         n_estimators=n_estimators, min_data_in_leaf=20,
         subsample=0.8, colsample_bytree=0.8,
         importance_type="gain", random_state=RANDOM_STATE, verbose=-1,
@@ -297,8 +272,7 @@ def build_lgbm_binary(n_estimators: int = 5000) -> lgb.LGBMClassifier:
 
 
 def build_xgb_binary(
-    n_estimators: int = 5000,
-    early_stopping: bool = True,
+    n_estimators: int = 5000, early_stopping: bool = True,
 ) -> xgb.XGBClassifier:
     return xgb.XGBClassifier(
         learning_rate=0.05, max_depth=6, min_child_weight=3,
@@ -311,8 +285,7 @@ def build_xgb_binary(
 
 
 def build_lgbm_multiclass(
-    n_classes: int,
-    n_estimators: int = 5000,
+    n_classes: int, n_estimators: int = 5000,
 ) -> lgb.LGBMClassifier:
     return lgb.LGBMClassifier(
         objective="multiclass", num_class=n_classes,
@@ -324,8 +297,7 @@ def build_lgbm_multiclass(
 
 
 def build_xgb_multiclass(
-    n_estimators: int = 5000,
-    early_stopping: bool = True,
+    n_estimators: int = 5000, early_stopping: bool = True,
 ) -> xgb.XGBClassifier:
     return xgb.XGBClassifier(
         objective="multi:softprob", num_class=3,
@@ -341,66 +313,71 @@ def build_xgb_multiclass(
 # FIGURES
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _save(fig: plt.Figure, path: str) -> None:
+    fig.savefig(path, **SAVEFIG_KW)
+    plt.close(fig)
+    print(f"  Saved → {path}")
+
+
 def plot_confusion(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    labels: list[str],
-    title: str,
-    fname: str,
+    y_true: np.ndarray, y_pred: np.ndarray,
+    labels: list[str], title: str, fname: str,
 ) -> None:
     cm      = confusion_matrix(y_true, y_pred,
                                labels=list(range(len(labels))))
     cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    fig.suptitle(title, fontsize=13, fontweight="bold")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle(title, fontweight="bold")
     for ax, data, fmt, t in [
         (axes[0], cm_norm, ".2f", "Row-normalised"),
         (axes[1], cm,      "d",   "Raw counts"),
     ]:
         sns.heatmap(data, annot=True, fmt=fmt, cmap="Blues",
                     xticklabels=labels, yticklabels=labels,
-                    linewidths=0.5, ax=ax)
+                    linewidths=0.5, ax=ax, annot_kws={"size": 10})
         ax.set_xlabel("Predicted"); ax.set_ylabel("True"); ax.set_title(t)
     plt.tight_layout()
-    fig.savefig(fname, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {fname}")
+    _save(fig, fname)
 
 
 def plot_roc_pr(
-    y_true: np.ndarray,
-    prob: np.ndarray,
-    pos_label_name: str,
-    title: str,
-    fname: str,
+    y_true: np.ndarray, prob: np.ndarray,
+    pos_label_name: str, title: str, fname: str,
 ) -> None:
     fpr, tpr, _  = roc_curve(y_true, prob)
     prec, rec, _ = precision_recall_curve(y_true, prob)
+    auc_roc      = roc_auc_score(y_true, prob)
+    auc_pr       = average_precision_score(y_true, prob)
+    prevalence   = y_true.mean()
+
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.suptitle(title, fontweight="bold")
+
     axes[0].plot(fpr, tpr, lw=2, color="steelblue",
-                 label=f"AUC={roc_auc_score(y_true, prob):.4f}")
+                 label=f"ROC-AUC = {auc_roc:.4f}")
     axes[0].plot([0, 1], [0, 1], "k--", lw=1)
-    axes[0].set_xlabel("FPR"); axes[0].set_ylabel("TPR")
-    axes[0].set_title("ROC"); axes[0].legend(fontsize=9)
+    axes[0].set_xlabel("False Positive Rate")
+    axes[0].set_ylabel("True Positive Rate")
+    axes[0].set_title("ROC Curve")
+    axes[0].legend()
+
     axes[1].plot(rec, prec, lw=2, color="steelblue",
-                 label=f"PR-AUC={average_precision_score(y_true, prob):.4f}")
-    axes[1].axhline(y_true.mean(), color="k", lw=1, ls="--",
-                    label=f"Baseline={y_true.mean():.3f}")
-    axes[1].set_xlabel("Recall"); axes[1].set_ylabel(f"Precision ({pos_label_name})")
-    axes[1].set_title("Precision-Recall"); axes[1].legend(fontsize=9)
+                 label=f"PR-AUC = {auc_pr:.4f}")
+    axes[1].axhline(prevalence, color="k", lw=1, ls="--",
+                    label=f"Random baseline ({prevalence:.3f})")
+    axes[1].set_xlabel("Recall")
+    axes[1].set_ylabel(f"Precision ({pos_label_name})")
+    axes[1].set_title("Precision–Recall Curve")
+    axes[1].legend()
+
     plt.tight_layout()
-    fig.savefig(fname, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {fname}")
+    _save(fig, fname)
 
 
 def plot_threshold_sweep(
-    y_true: np.ndarray,
-    prob: np.ndarray,
-    thresholds_dict: dict,
-    pos_label_name: str,
-    fname: str,
+    y_true: np.ndarray, prob: np.ndarray,
+    thresholds_dict: dict, pos_label_name: str, fname: str,
 ) -> None:
     ts = np.linspace(0.01, 0.99, 300)
     f1s, precs, recs = [], [], []
@@ -411,11 +388,13 @@ def plot_threshold_sweep(
         )
         f1s.append(f[1]); precs.append(p[1]); recs.append(r[1])
 
-    colors = {"youden": "black", "f1_opt": "seagreen", "prec_match": "tomato"}
-    labels = {"youden": "Youden-J", "f1_opt": "F1-optimal",
-              "prec_match": "Precision-matched"}
+    style = {
+        "youden":     ("black",    "Youden-J"),
+        "f1_opt":     ("seagreen", "F1-optimal"),
+        "prec_match": ("tomato",   "Precision-matched"),
+    }
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, ax = plt.subplots(figsize=(10, 5))
     ax.plot(ts, f1s,   lw=2, color="steelblue",
             label=f"F1 ({pos_label_name})")
     ax.plot(ts, precs, lw=2, color="tomato",    alpha=0.7,
@@ -423,384 +402,351 @@ def plot_threshold_sweep(
     ax.plot(ts, recs,  lw=2, color="seagreen",  alpha=0.7,
             label=f"Recall ({pos_label_name})")
     for key, thr in thresholds_dict.items():
-        ax.axvline(thr, color=colors[key], lw=1.5, ls="--",
-                   label=f"{labels[key]} = {thr:.3f}")
-    ax.set_xlabel("Decision Threshold"); ax.set_ylabel("Score")
-    ax.set_title(f"Stage 1 — Threshold Sweep ({pos_label_name})",
-                 fontsize=11, fontweight="bold")
-    ax.legend(fontsize=8)
+        color, label = style[key]
+        ax.axvline(thr, color=color, lw=1.5, ls="--",
+                   label=f"{label} = {thr:.3f}")
+    ax.set_xlabel("Decision Threshold")
+    ax.set_ylabel("Score")
+    ax.set_title(f"Binary Classifier — Threshold Sweep ({pos_label_name})",
+                 fontweight="bold")
+    ax.legend(loc="center left")
     ax.xaxis.set_minor_locator(mticker.MultipleLocator(0.05))
     ax.grid(which="major", ls="--", alpha=0.4)
     plt.tight_layout()
-    fig.savefig(fname, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {fname}")
+    _save(fig, fname)
 
 
 def plot_pr_comparison(
-    y_true_s1: np.ndarray,
-    prob_s1: np.ndarray,
-    oneshot_metrics: dict,
-    thresholds_dict: dict,
-    fname: str,
+    y_true:         np.ndarray,
+    prob:           np.ndarray,
+    oneshot_m:      dict,
+    thresholds:     dict,
+    fname:          str,
 ) -> None:
     """
-    Key figure: full PR curve for two-stage vs single operating point
-    of one-shot. Demonstrates that two-stage dominates in P-R space.
+    Key figure: PR curve for binary classifier vs fixed one-shot point.
+    Demonstrates that the binary classifier exposes a tunable frontier
+    unavailable to the softmax formulation.
     """
-    prec, rec, _ = precision_recall_curve(y_true_s1, prob_s1)
-    auc_pr       = average_precision_score(y_true_s1, prob_s1)
+    prec, rec, _ = precision_recall_curve(y_true, prob)
+    auc_pr       = average_precision_score(y_true, prob)
 
-    op_colors = {
+    op_style = {
         "youden":     ("black",    "Youden-J"),
         "f1_opt":     ("seagreen", "F1-optimal"),
         "prec_match": ("tomato",   "Precision-matched"),
     }
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    fig, ax = plt.subplots(figsize=(7, 6))
     ax.plot(rec, prec, lw=2.5, color="steelblue", zorder=2,
-            label=f"Two-stage Stage 1 (PR AUC = {auc_pr:.4f})")
-    ax.axhline(y_true_s1.mean(), color="grey", lw=1, ls="--",
-               label=f"Random (prevalence = {y_true_s1.mean():.3f})")
+            label=f"Binary classifier (PR-AUC = {auc_pr:.4f})")
+    ax.axhline(y_true.mean(), color="grey", lw=1, ls="--",
+               label=f"Random (prevalence = {y_true.mean():.3f})")
 
-    # One-shot fixed operating point
+    # One-shot fixed point
     ax.scatter(
-        [oneshot_metrics["recall_class2"]],
-        [oneshot_metrics["precision_class2"]],
+        [oneshot_m["recall_class2"]],
+        [oneshot_m["precision_class2"]],
         marker="*", s=350, color="orange", zorder=5,
         label=(f"One-shot  "
-               f"P={oneshot_metrics['precision_class2']:.3f}  "
-               f"R={oneshot_metrics['recall_class2']:.3f}  "
-               f"F1={oneshot_metrics['f1_class2']:.3f}"),
+               f"P={oneshot_m['precision_class2']:.3f}  "
+               f"R={oneshot_m['recall_class2']:.3f}"),
     )
 
-    # Two-stage operating points
-    for key, thr in thresholds_dict.items():
-        pred = (prob_s1 >= thr).astype(int)
+    # Binary operating points
+    for key, thr in thresholds.items():
+        pred = (prob >= thr).astype(int)
         p_arr, r_arr, f_arr, _ = precision_recall_fscore_support(
-            y_true_s1, pred, labels=[0, 1], zero_division=0
+            y_true, pred, labels=[0, 1], zero_division=0
         )
-        color, label_str = op_colors[key]
+        color, label = op_style[key]
         ax.scatter(
             [r_arr[1]], [p_arr[1]],
-            marker="o", s=130, color=color, zorder=5,
-            label=(f"Two-stage ({label_str})  "
+            marker="o", s=120, color=color, zorder=5,
+            label=(f"{label}  "
                    f"P={p_arr[1]:.3f}  R={r_arr[1]:.3f}  "
                    f"F1={f_arr[1]:.3f}"),
         )
 
-    ax.set_xlabel("Recall (Half-metal)", fontsize=11)
-    ax.set_ylabel("Precision (Half-metal)", fontsize=11)
+    ax.set_xlabel("Recall (Half-metal)")
+    ax.set_ylabel("Precision (Half-metal)")
     ax.set_title(
-        "One-Shot vs Two-Stage: Precision–Recall Space\n"
-        "(orange star = one-shot fixed point; "
-        "circles = two-stage tunable thresholds)",
-        fontsize=10, fontweight="bold",
+        "One-Shot vs Binary Classifier\nPrecision–Recall Space",
+        fontweight="bold",
     )
-    ax.legend(fontsize=8, loc="upper right")
+    ax.legend(loc="upper right", fontsize=8)
     ax.set_xlim([0, 1.02]); ax.set_ylim([0, 1.05])
     ax.grid(ls="--", alpha=0.3)
     plt.tight_layout()
-    fig.savefig(fname, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {fname}")
+    _save(fig, fname)
 
 
 def plot_comparison_bar(
-    comparison_rows: list[dict],
-    fname: str,
+    comparison_rows: list[dict], fname: str,
 ) -> None:
     labels = [r["model"] for r in comparison_rows]
     prec   = [r["precision_hm"] for r in comparison_rows]
     rec    = [r["recall_hm"]    for r in comparison_rows]
     f1     = [r["f1_hm"]        for r in comparison_rows]
     x      = np.arange(len(labels))
-    width  = 0.25
+    w      = 0.25
 
-    fig, ax = plt.subplots(figsize=(max(10, len(labels) * 1.8), 5))
-    ax.bar(x - width, prec, width, label="Precision",
-           color="tomato",    alpha=0.85)
-    ax.bar(x,         rec,  width, label="Recall",
-           color="steelblue", alpha=0.85)
-    ax.bar(x + width, f1,   width, label="F1",
-           color="seagreen",  alpha=0.85)
+    fig, ax = plt.subplots(figsize=(max(9, len(labels) * 1.8), 5))
+    ax.bar(x - w, prec, w, label="Precision", color="tomato",    alpha=0.85)
+    ax.bar(x,     rec,  w, label="Recall",    color="steelblue", alpha=0.85)
+    ax.bar(x + w, f1,   w, label="F1",        color="seagreen",  alpha=0.85)
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
     ax.set_ylabel("Score"); ax.set_ylim([0, 1.05])
     ax.set_title("Half-metal Detection — Model Comparison\n"
                  "(Precision / Recall / F1 for half-metal class)",
-                 fontsize=11, fontweight="bold")
-    ax.legend(fontsize=9)
-    ax.grid(axis="y", ls="--", alpha=0.4)
+                 fontweight="bold")
+    ax.legend(); ax.grid(axis="y", ls="--", alpha=0.4)
     plt.tight_layout()
-    fig.savefig(fname, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {fname}")
+    _save(fig, fname)
 
 
 def plot_feature_importance(
-    feat_importances: list[np.ndarray],
+    importances:   list[np.ndarray],
     feature_names: list[str],
-    title: str,
-    fname: str,
-    top_n: int = 20,
+    title:         str,
+    fname:         str,
+    top_n:         int = 20,
 ) -> None:
-    mean_imp = np.mean(feat_importances, axis=0)
-    std_imp  = np.std(feat_importances,  axis=0)
-    idx      = np.argsort(mean_imp)[-top_n:][::-1]
-    fig, ax  = plt.subplots(figsize=(10, max(6, top_n * 0.28)))
-    y_pos    = np.arange(top_n)
-    ax.barh(y_pos, mean_imp[idx][::-1], xerr=std_imp[idx][::-1],
-            color="steelblue", ecolor="grey", alpha=0.85,
-            height=0.7, capsize=3)
+    mean_imp = np.mean(importances, axis=0)
+    std_imp  = np.std(importances,  axis=0)
+    idx      = np.argsort(mean_imp)[-top_n:]
+
+    fig, ax = plt.subplots(figsize=(9, max(5, top_n * 0.30)))
+    y_pos   = np.arange(top_n)
+    ax.barh(y_pos, mean_imp[idx], xerr=std_imp[idx],
+            color="steelblue", ecolor="grey",
+            alpha=0.85, height=0.7, capsize=3)
     ax.set_yticks(y_pos)
-    ax.set_yticklabels([feature_names[i] for i in idx[::-1]], fontsize=9)
+    ax.set_yticklabels([feature_names[i] for i in idx])
     ax.set_xlabel("Mean Gain Importance (± std)")
-    ax.set_title(title)
-    ax.invert_yaxis()
+    ax.set_title(title, fontweight="bold")
     plt.tight_layout()
-    fig.savefig(fname, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Saved → {fname}")
+    _save(fig, fname)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# APPROACH 1 — ONE-SHOT THREE-CLASS
+# APPROACH 1 — ONE-SHOT TERNARY
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_oneshot(X: pd.DataFrame, y: pd.Series) -> dict:
-    """5-seed capped undersampling, LGBM + XGBoost multiclass ensemble."""
-    n_classes = 3
-
-    print(f"\n{'═' * 60}")
-    print(f"  APPROACH 1 — One-Shot Three-Class (Baseline)")
-    print(f"{'═' * 60}")
+def train_oneshot(
+    X: pd.DataFrame, y: pd.Series, feature_names: list[str],
+) -> dict:
+    print(f"\n{'═'*60}")
+    print(f"  APPROACH 1 — One-Shot Ternary (Baseline)")
+    print(f"{'═'*60}")
     for cls, label in CLASS_NAMES.items():
-        print(f"  Class {cls} ({label}): {(y == cls).sum()}")
-    eff = (y == 2).sum() + MAJORITY_CAP * 2
-    print(f"  Majority cap: {MAJORITY_CAP}  (~{eff} rows per model  "
-          f"ratio ≈ {MAJORITY_CAP/(y==2).sum():.1f}:"
-          f"{MAJORITY_CAP/(y==2).sum():.1f}:1)")
-    print(f"  {N_SPLITS}-fold × {len(UNDERSAMPLE_SEEDS)} seeds = "
-          f"{N_SPLITS * len(UNDERSAMPLE_SEEDS)} models per algorithm")
+        print(f"  Class {cls} ({label}): {(y==cls).sum()}")
 
     cv    = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
                             random_state=RANDOM_STATE)
     folds = list(cv.split(X, y))
 
-    oof_proba_by_seed: dict[int, np.ndarray] = {}
-    seed_cv_metrics:   dict[int, list[dict]] = {}
-    best_iters_lgb:    dict[int, list[int]]  = {}
-    best_iters_xgb:    dict[int, list[int]]  = {}
-    final_lgb:         dict[int, lgb.LGBMClassifier] = {}
-    final_xgb:         dict[int, xgb.XGBClassifier]  = {}
+    oof_proba_seeds: dict[int, np.ndarray] = {}
+    seed_cv:         dict[int, list[dict]] = {}
+    best_iters_lgb:  dict[int, list[int]]  = {}
+    best_iters_xgb:  dict[int, list[int]]  = {}
+    final_lgb:       dict[int, lgb.LGBMClassifier] = {}
+    final_xgb:       dict[int, xgb.XGBClassifier]  = {}
+    lgb_imps: list[np.ndarray] = []
     y_oof = np.full(len(y), -1, dtype=int)
 
     for seed in UNDERSAMPLE_SEEDS:
-        print(f"\n  Seed {seed}  {'─' * 45}")
-        oof_proba = np.zeros((len(y), n_classes))
-        fold_metrics = []
-        iters_lgb, iters_xgb = [], []
+        print(f"\n  Seed {seed}  {'─'*45}")
+        oof_p = np.zeros((len(y), 3))
+        folds_m, il, ix = [], [], []
 
         for fold, (tr_idx, va_idx) in enumerate(folds, 1):
-            Xva = X.iloc[va_idx]
-            yva = y.iloc[va_idx]
+            Xva, yva = X.iloc[va_idx], y.iloc[va_idx]
             if seed == UNDERSAMPLE_SEEDS[0]:
                 y_oof[va_idx] = yva.values
 
-            Xtr_bal, ytr_bal = undersample_capped(
+            Xb, yb = undersample_capped(
                 X.iloc[tr_idx], y.iloc[tr_idx],
                 minority_class=2, majority_cap=MAJORITY_CAP, seed=seed,
             )
-
-            lgbm = build_lgbm_multiclass(n_classes)
+            lgbm = build_lgbm_multiclass(3)
             xgbm = build_xgb_multiclass(early_stopping=True)
+            lgbm.fit(Xb, yb, eval_set=[(Xva, yva)],
+                     eval_metric="multi_logloss",
+                     callbacks=[lgb.early_stopping(200, verbose=False),
+                                lgb.log_evaluation(period=-1)])
+            xgbm.fit(Xb, yb, eval_set=[(Xva, yva)], verbose=False)
 
-            lgbm.fit(
-                Xtr_bal, ytr_bal,
-                eval_set=[(Xva, yva)], eval_metric="multi_logloss",
-                callbacks=[lgb.early_stopping(200, verbose=False),
-                           lgb.log_evaluation(period=-1)],
-            )
-            xgbm.fit(Xtr_bal, ytr_bal, eval_set=[(Xva, yva)], verbose=False)
+            il.append(lgbm.best_iteration_)
+            ix.append(xgbm.best_iteration)
+            lgb_imps.append(lgbm.feature_importances_)
 
-            iters_lgb.append(lgbm.best_iteration_)
-            iters_xgb.append(xgbm.best_iteration)
-
-            p_ens = (lgbm.predict_proba(Xva) + xgbm.predict_proba(Xva)) / 2
-            oof_proba[va_idx] += p_ens
+            p_ens = (lgbm.predict_proba(Xva) +
+                     xgbm.predict_proba(Xva)) / 2
+            oof_p[va_idx] += p_ens
 
             fm = three_class_metrics(yva.values, np.argmax(p_ens, axis=1))
-            fold_metrics.append(fm)
-            print(f"  fold {fold}/{N_SPLITS}  "
-                  f"lgbm={lgbm.best_iteration_:4d}  "
+            folds_m.append(fm)
+            print(f"  fold {fold}  lgbm={lgbm.best_iteration_:4d}  "
                   f"xgb={xgbm.best_iteration:4d}  "
                   f"macro_F1={fm['macro_f1']:.4f}  "
                   f"F1_hm={fm['f1_class2']:.4f}  "
                   f"P_hm={fm['precision_class2']:.4f}  "
                   f"R_hm={fm['recall_class2']:.4f}")
 
-        oof_proba_by_seed[seed] = oof_proba
-        seed_cv_metrics[seed]   = fold_metrics
-        best_iters_lgb[seed]    = iters_lgb
-        best_iters_xgb[seed]    = iters_xgb
+        oof_proba_seeds[seed] = oof_p
+        seed_cv[seed]        = folds_m
+        best_iters_lgb[seed] = il
+        best_iters_xgb[seed] = ix
 
     # Ensemble OOF
-    ens_proba = np.mean([oof_proba_by_seed[s]
-                         for s in UNDERSAMPLE_SEEDS], axis=0)
+    ens_proba = np.mean(list(oof_proba_seeds.values()), axis=0)
     ens_pred  = np.argmax(ens_proba, axis=1)
     ens_m     = three_class_metrics(y_oof, ens_pred)
     cm        = confusion_matrix(y_oof, ens_pred, labels=[0, 1, 2])
 
-    print(f"\n  One-shot Ensemble OOF:")
-    for k, v in ens_m.items():
-        print(f"    {k}: {v:.4f}")
-    print(f"\n  Confusion matrix:\n{cm}")
+    print(f"\n  One-shot OOF: macro_F1={ens_m['macro_f1']:.4f}  "
+          f"F1_hm={ens_m['f1_class2']:.4f}  "
+          f"P_hm={ens_m['precision_class2']:.4f}  "
+          f"R_hm={ens_m['recall_class2']:.4f}")
+    print(f"  Confusion:\n{cm}")
 
     # Final fit
-    print(f"\n  One-shot final fit — full dataset, one model per seed")
     for seed in UNDERSAMPLE_SEEDS:
-        mean_lgb = max(1, int(np.mean(best_iters_lgb[seed])))
-        mean_xgb = max(1, int(np.mean(best_iters_xgb[seed])))
-        X_bal, y_bal = undersample_capped(
+        ml = max(1, int(np.mean(best_iters_lgb[seed])))
+        mx = max(1, int(np.mean(best_iters_xgb[seed])))
+        Xb, yb = undersample_capped(
             X, y, minority_class=2, majority_cap=MAJORITY_CAP, seed=seed,
         )
-        m_lgb = build_lgbm_multiclass(n_classes, n_estimators=mean_lgb)
-        m_xgb = build_xgb_multiclass(n_estimators=mean_xgb,
-                                      early_stopping=False)
-        m_lgb.fit(X_bal, y_bal)
-        m_xgb.fit(X_bal, y_bal)
+        m_lgb = build_lgbm_multiclass(3, n_estimators=ml)
+        m_xgb = build_xgb_multiclass(n_estimators=mx, early_stopping=False)
+        m_lgb.fit(Xb, yb); m_xgb.fit(Xb, yb)
         final_lgb[seed] = m_lgb
         final_xgb[seed] = m_xgb
-        print(f"  seed {seed:3d}  lgbm={mean_lgb}  xgb={mean_xgb}")
 
     plot_confusion(
-        y_oof, ens_pred, [CLASS_NAMES[i] for i in range(3)],
-        "One-Shot Three-Class — Confusion Matrix (Ensemble OOF)",
+        y_oof, ens_pred,
+        [CLASS_NAMES[i] for i in range(3)],
+        "One-Shot Ternary — Confusion Matrix (Ensemble OOF)",
         os.path.join(IMG_DIR, "oneshot_confusion.png"),
+    )
+    plot_feature_importance(
+        lgb_imps, feature_names,
+        "One-Shot LGBM — Feature Importance (Top 20)",
+        os.path.join(IMG_DIR, "feature_importance_oneshot.png"),
     )
 
     return dict(
-        final_lgb       = final_lgb,
-        final_xgb       = final_xgb,
-        oof_proba       = ens_proba,
-        oof_pred        = ens_pred,
-        oof_true        = y_oof,
-        oof_metrics     = ens_m,
-        seed_cv_metrics = seed_cv_metrics,
-        confusion_matrix = cm.tolist(),
+        final_lgb    = final_lgb,
+        final_xgb    = final_xgb,
+        oof_proba    = ens_proba,
+        oof_pred     = ens_pred,
+        oof_true     = y_oof,
+        oof_metrics  = ens_m,
+        seed_cv      = seed_cv,
+        confusion    = cm.tolist(),
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# APPROACH 2 — STAGE 1: HALF-METAL DETECTOR
+# APPROACH 2 — BINARY HALF-METAL DETECTOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_stage1(
-    X: pd.DataFrame,
-    y_3class: pd.Series,
-    feature_names: list[str],
-    oneshot_precision: float,
+def train_binary(
+    X: pd.DataFrame, y_3class: pd.Series,
+    feature_names: list[str], oneshot_precision: float,
 ) -> dict:
-    """5-seed 1:1 undersampling, LGBM + XGBoost binary ensemble.
-    Three thresholds evaluated: Youden-J, F1-optimal, precision-matched."""
+    """
+    5-seed 1:1 undersampling binary classifier.
+    Half-metal=1, everything else=0.
+    Three thresholds selected from OOF probabilities.
+    """
     y_bin = (y_3class == 2).astype(int)
     y_bin.index = y_3class.index
 
-    n_hm  = (y_bin == 1).sum()
-    n_not = (y_bin == 0).sum()
-
-    print(f"\n{'═' * 60}")
-    print(f"  APPROACH 2 — Stage 1: Half-metal Detector")
-    print(f"{'═' * 60}")
-    print(f"  Half-metal: {n_hm}   Not: {n_not}   Ratio {n_not/n_hm:.1f}:1")
+    print(f"\n{'═'*60}")
+    print(f"  APPROACH 2 — Binary Half-metal Detector")
+    print(f"{'═'*60}")
+    print(f"  Half-metal: {(y_bin==1).sum()}   "
+          f"Not: {(y_bin==0).sum()}   "
+          f"Ratio {(y_bin==0).sum()/(y_bin==1).sum():.1f}:1")
     print(f"  Precision target (one-shot match): {oneshot_precision:.4f}")
 
     cv    = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
                             random_state=RANDOM_STATE)
     folds = list(cv.split(X, y_bin))
 
-    oof_lgb_by_seed: dict[int, np.ndarray] = {}
-    oof_xgb_by_seed: dict[int, np.ndarray] = {}
-    seed_cv_metrics: dict[int, list[dict]] = {}
-    best_iters_lgb:  dict[int, list[int]]  = {}
-    best_iters_xgb:  dict[int, list[int]]  = {}
-    final_lgb:       dict[int, lgb.LGBMClassifier] = {}
-    final_xgb:       dict[int, xgb.XGBClassifier]  = {}
-    all_lgb_imps:    list[np.ndarray] = []
+    oof_lgb_seeds: dict[int, np.ndarray] = {}
+    oof_xgb_seeds: dict[int, np.ndarray] = {}
+    seed_cv:       dict[int, list[dict]] = {}
+    best_iters_lgb: dict[int, list[int]] = {}
+    best_iters_xgb: dict[int, list[int]] = {}
+    final_lgb:      dict[int, lgb.LGBMClassifier] = {}
+    final_xgb:      dict[int, xgb.XGBClassifier]  = {}
+    lgb_imps: list[np.ndarray] = []
     y_oof = np.zeros(len(y_bin))
 
     for seed in UNDERSAMPLE_SEEDS:
-        print(f"\n  Seed {seed}  {'─' * 45}")
-        oof_lgb  = np.zeros(len(y_bin))
-        oof_xgb  = np.zeros(len(y_bin))
-        f_metrics = []
-        iters_lgb, iters_xgb = [], []
+        print(f"\n  Seed {seed}  {'─'*45}")
+        oof_l = np.zeros(len(y_bin))
+        oof_x = np.zeros(len(y_bin))
+        folds_m, il, ix = [], [], []
 
         for fold, (tr_idx, va_idx) in enumerate(folds, 1):
-            Xva = X.iloc[va_idx]
-            yva = y_bin.iloc[va_idx]
+            Xva, yva = X.iloc[va_idx], y_bin.iloc[va_idx]
             if seed == UNDERSAMPLE_SEEDS[0]:
                 y_oof[va_idx] = yva.values
 
-            Xtr_bal, ytr_bal = undersample_strict(
+            Xb, yb = undersample_strict(
                 X.iloc[tr_idx], y_bin.iloc[tr_idx],
                 minority_class=1, seed=seed,
             )
-
             lgbm = build_lgbm_binary()
             xgbm = build_xgb_binary(early_stopping=True)
-            lgbm.fit(
-                Xtr_bal, ytr_bal,
-                eval_set=[(Xva, yva)], eval_metric="auc",
-                callbacks=[lgb.early_stopping(200, verbose=False),
-                           lgb.log_evaluation(period=-1)],
-            )
-            xgbm.fit(Xtr_bal, ytr_bal,
-                     eval_set=[(Xva, yva)], verbose=False)
+            lgbm.fit(Xb, yb, eval_set=[(Xva, yva)],
+                     eval_metric="auc",
+                     callbacks=[lgb.early_stopping(200, verbose=False),
+                                lgb.log_evaluation(period=-1)])
+            xgbm.fit(Xb, yb, eval_set=[(Xva, yva)], verbose=False)
 
-            iters_lgb.append(lgbm.best_iteration_)
-            iters_xgb.append(xgbm.best_iteration)
-            all_lgb_imps.append(lgbm.feature_importances_)
+            il.append(lgbm.best_iteration_)
+            ix.append(xgbm.best_iteration)
+            lgb_imps.append(lgbm.feature_importances_)
 
-            p_ens = (lgbm.predict_proba(Xva)[:, 1] +
-                     xgbm.predict_proba(Xva)[:, 1]) / 2
-            oof_lgb[va_idx] = lgbm.predict_proba(Xva)[:, 1]
-            oof_xgb[va_idx] = xgbm.predict_proba(Xva)[:, 1]
-
+            oof_l[va_idx] = lgbm.predict_proba(Xva)[:, 1]
+            oof_x[va_idx] = xgbm.predict_proba(Xva)[:, 1]
+            p_ens = (oof_l[va_idx] + oof_x[va_idx]) / 2
             fm = binary_metrics(yva.values, p_ens, thr=0.5)
-            f_metrics.append(fm)
-            print(f"  fold {fold}/{N_SPLITS}  "
-                  f"lgbm={lgbm.best_iteration_:4d}  "
+            folds_m.append(fm)
+            print(f"  fold {fold}  lgbm={lgbm.best_iteration_:4d}  "
                   f"xgb={xgbm.best_iteration:4d}  "
                   f"AUC={fm['roc_auc']:.4f}  "
                   f"P={fm['precision_class1']:.4f}  "
-                  f"R={fm['recall_class1']:.4f}  "
-                  f"F1={fm['f1_class1']:.4f}")
+                  f"R={fm['recall_class1']:.4f}")
 
-        oof_lgb_by_seed[seed] = oof_lgb
-        oof_xgb_by_seed[seed] = oof_xgb
-        seed_cv_metrics[seed] = f_metrics
-        best_iters_lgb[seed]  = iters_lgb
-        best_iters_xgb[seed]  = iters_xgb
+        oof_lgb_seeds[seed] = oof_l
+        oof_xgb_seeds[seed] = oof_x
+        seed_cv[seed]       = folds_m
+        best_iters_lgb[seed] = il
+        best_iters_xgb[seed] = ix
 
-    # Ensemble OOF
-    all_probs = ([oof_lgb_by_seed[s] for s in UNDERSAMPLE_SEEDS] +
-                 [oof_xgb_by_seed[s] for s in UNDERSAMPLE_SEEDS])
+    # Ensemble OOF (all seeds × both models)
+    all_probs = (list(oof_lgb_seeds.values()) +
+                 list(oof_xgb_seeds.values()))
     ens_prob  = np.mean(all_probs, axis=0)
 
     # Three thresholds
-    thr_youden = oof_best_threshold(y_oof, ens_prob)
-    thr_f1opt  = f1_optimal_threshold(y_oof, ens_prob)
-    thr_pmatch = precision_matched_threshold(y_oof, ens_prob,
-                                             oneshot_precision)
     thresholds = {
-        "youden":     thr_youden,
-        "f1_opt":     thr_f1opt,
-        "prec_match": thr_pmatch,
+        "youden":     youden_threshold(y_oof, ens_prob),
+        "f1_opt":     f1_optimal_threshold(y_oof, ens_prob),
+        "prec_match": precision_matched_threshold(
+                          y_oof, ens_prob, oneshot_precision),
     }
 
-    print(f"\n  Stage 1 thresholds:")
+    print(f"\n  Binary OOF  ROC-AUC={roc_auc_score(y_oof, ens_prob):.4f}  "
+          f"PR-AUC={average_precision_score(y_oof, ens_prob):.4f}")
+
     metrics_per_thr = {}
     for name, thr in thresholds.items():
         m = binary_metrics(y_oof, ens_prob, thr)
@@ -811,204 +757,47 @@ def train_stage1(
               f"F1={m['f1_class1']:.4f}")
 
     # Final fit
-    print(f"\n  Stage 1 final fit — full dataset")
     for seed in UNDERSAMPLE_SEEDS:
-        mean_lgb = max(1, int(np.mean(best_iters_lgb[seed])))
-        mean_xgb = max(1, int(np.mean(best_iters_xgb[seed])))
-        X_bal, y_bal = undersample_strict(X, y_bin,
-                                          minority_class=1, seed=seed)
-        m_lgb = build_lgbm_binary(n_estimators=mean_lgb)
-        m_xgb = build_xgb_binary(n_estimators=mean_xgb, early_stopping=False)
-        m_lgb.fit(X_bal, y_bal)
-        m_xgb.fit(X_bal, y_bal)
+        ml = max(1, int(np.mean(best_iters_lgb[seed])))
+        mx = max(1, int(np.mean(best_iters_xgb[seed])))
+        Xb, yb = undersample_strict(X, y_bin, minority_class=1, seed=seed)
+        m_lgb = build_lgbm_binary(n_estimators=ml)
+        m_xgb = build_xgb_binary(n_estimators=mx, early_stopping=False)
+        m_lgb.fit(Xb, yb); m_xgb.fit(Xb, yb)
         final_lgb[seed] = m_lgb
         final_xgb[seed] = m_xgb
-        print(f"  seed {seed:3d}  lgbm={mean_lgb}  xgb={mean_xgb}")
 
     # Figures
     plot_roc_pr(
         y_oof, ens_prob, "Half-metal",
-        "Stage 1 — Half-metal Detector (Ensemble OOF)",
-        os.path.join(IMG_DIR, "stage1_roc_pr.png"),
+        "Binary Half-metal Detector — ROC and PR Curves (Ensemble OOF)",
+        os.path.join(IMG_DIR, "binary_roc_pr.png"),
     )
     plot_threshold_sweep(
         y_oof, ens_prob, thresholds, "Half-metal",
-        os.path.join(IMG_DIR, "stage1_threshold_sweep.png"),
+        os.path.join(IMG_DIR, "binary_threshold_sweep.png"),
     )
     plot_confusion(
-        y_oof, (ens_prob >= thr_youden).astype(int),
+        y_oof, (ens_prob >= thresholds["youden"]).astype(int),
         ["Not half-metal", "Half-metal"],
-        "Stage 1 — Confusion Matrix (Youden-J, Ensemble OOF)",
-        os.path.join(IMG_DIR, "stage1_confusion.png"),
-    )
-    plot_feature_importance(
-        all_lgb_imps, feature_names,
-        "Stage 1 LGBM — Feature Importance (Top 20, mean ± std)",
-        os.path.join(IMG_DIR, "feature_importance_stage1.png"),
-    )
-
-    return dict(
-        final_lgb           = final_lgb,
-        final_xgb           = final_xgb,
-        oof_prob            = ens_prob,
-        oof_true            = y_oof,
-        thresholds          = thresholds,
-        seed_cv_metrics     = seed_cv_metrics,
-        metrics_per_threshold = metrics_per_thr,
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# APPROACH 2 — STAGE 2: CONDUCTOR / INSULATOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-def train_stage2(
-    X: pd.DataFrame,
-    y_3class: pd.Series,
-    feature_names: list[str],
-) -> dict:
-    """LGBM + XGBoost binary classifier on non-half-metal samples."""
-    mask = y_3class != 2
-    X_s2 = X.loc[mask]
-    y_s2 = y_3class.loc[mask].copy()
-    n0   = (y_s2 == 0).sum()
-    n1   = (y_s2 == 1).sum()
-
-    print(f"\n{'═' * 60}")
-    print(f"  APPROACH 2 — Stage 2: Conductor / Insulator")
-    print(f"{'═' * 60}")
-    print(f"  Conductor: {n0}   Insulator: {n1}   Ratio {n0/n1:.2f}:1")
-
-    cv    = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                            random_state=RANDOM_STATE)
-    folds = list(cv.split(X_s2, y_s2))
-
-    oof_lgb        = np.zeros(len(y_s2))
-    oof_xgb        = np.zeros(len(y_s2))
-    metrics_lgb    = []
-    metrics_xgb    = []
-    best_iters_lgb = []
-    best_iters_xgb = []
-    lgb_imps: list[np.ndarray] = []
-
-    print(f"\n  {'Fold':<6} {'LGBM iter':>9}  {'AUC':>7}  "
-          f"{'XGB iter':>8}  {'AUC':>7}")
-
-    for fold, (tr_idx, va_idx) in enumerate(folds, 1):
-        Xtr, Xva = X_s2.iloc[tr_idx], X_s2.iloc[va_idx]
-        ytr, yva = y_s2.iloc[tr_idx], y_s2.iloc[va_idx]
-
-        lgbm = build_lgbm_binary()
-        xgbm = build_xgb_binary(early_stopping=True)
-        lgbm.fit(
-            Xtr, ytr, eval_set=[(Xva, yva)], eval_metric="auc",
-            callbacks=[lgb.early_stopping(200, verbose=False),
-                       lgb.log_evaluation(period=-1)],
-        )
-        xgbm.fit(Xtr, ytr, eval_set=[(Xva, yva)], verbose=False)
-
-        best_iters_lgb.append(lgbm.best_iteration_)
-        best_iters_xgb.append(xgbm.best_iteration)
-        lgb_imps.append(lgbm.feature_importances_)
-        oof_lgb[va_idx] = lgbm.predict_proba(Xva)[:, 1]
-        oof_xgb[va_idx] = xgbm.predict_proba(Xva)[:, 1]
-
-        m_lgb = binary_metrics(yva.values, oof_lgb[va_idx], thr=0.5)
-        m_xgb = binary_metrics(yva.values, oof_xgb[va_idx], thr=0.5)
-        metrics_lgb.append(m_lgb)
-        metrics_xgb.append(m_xgb)
-        print(f"  {fold}/{N_SPLITS}      "
-              f"{lgbm.best_iteration_:9d}  {m_lgb['roc_auc']:7.4f}  "
-              f"{xgbm.best_iteration:8d}  {m_xgb['roc_auc']:7.4f}")
-
-    ens_prob_s2 = (oof_lgb + oof_xgb) / 2
-    thr_s2      = oof_best_threshold(y_s2.values, ens_prob_s2)
-    ens_m_s2    = binary_metrics(y_s2.values, ens_prob_s2, thr=thr_s2)
-
-    print(f"\n  OOF Ensemble (thr={thr_s2:.3f})  "
-          f"AUC={ens_m_s2['roc_auc']:.4f}  "
-          f"macro_F1={ens_m_s2['macro_f1']:.4f}")
-
-    mean_lgb = max(1, int(np.mean(best_iters_lgb)))
-    mean_xgb = max(1, int(np.mean(best_iters_xgb)))
-    final_lgb = build_lgbm_binary(n_estimators=mean_lgb)
-    final_xgb = build_xgb_binary(n_estimators=mean_xgb, early_stopping=False)
-    final_lgb.fit(X_s2, y_s2)
-    final_xgb.fit(X_s2, y_s2)
-
-    plot_roc_pr(
-        y_s2.values, ens_prob_s2, "Insulator",
-        "Stage 2 — Conductor/Insulator (Ensemble OOF)",
-        os.path.join(IMG_DIR, "stage2_roc_pr.png"),
-    )
-    plot_confusion(
-        y_s2.values, (ens_prob_s2 >= thr_s2).astype(int),
-        ["Conductor", "Insulator"],
-        "Stage 2 — Confusion Matrix (Ensemble OOF)",
-        os.path.join(IMG_DIR, "stage2_confusion.png"),
+        "Binary Classifier — Confusion Matrix (Youden-J, Ensemble OOF)",
+        os.path.join(IMG_DIR, "binary_confusion_youden.png"),
     )
     plot_feature_importance(
         lgb_imps, feature_names,
-        "Stage 2 LGBM — Feature Importance (Top 20, mean ± std over folds)",
-        os.path.join(IMG_DIR, "feature_importance_stage2.png"),
+        "Binary LGBM — Feature Importance (Top 20)",
+        os.path.join(IMG_DIR, "feature_importance_binary.png"),
     )
 
     return dict(
-        final_lgb   = final_lgb,
-        final_xgb   = final_xgb,
-        threshold   = thr_s2,
-        oof_prob    = ens_prob_s2,
-        oof_true    = y_s2.values,
-        oof_metrics = ens_m_s2,
-        cv_lgb      = summarize(metrics_lgb),
-        cv_xgb      = summarize(metrics_xgb),
+        final_lgb         = final_lgb,
+        final_xgb         = final_xgb,
+        oof_prob          = ens_prob,
+        oof_true          = y_oof,
+        thresholds        = thresholds,
+        seed_cv           = seed_cv,
+        metrics_per_thr   = metrics_per_thr,
     )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TWO-STAGE END-TO-END EVALUATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def evaluate_twostage_e2e(
-    y_3class: pd.Series,
-    s1_oof_prob: np.ndarray,
-    s1_thr: float,
-    s2_oof_prob: np.ndarray,
-    s2_thr: float,
-    label: str,
-) -> dict:
-    """Reconstruct full three-class predictions and evaluate."""
-    y           = y_3class.values
-    s1_pred     = (s1_oof_prob >= s1_thr).astype(int)
-    mask_not_hm = y_3class != 2
-    idx_not_hm  = np.where(mask_not_hm)[0]
-    s2_pred_sub = (s2_oof_prob >= s2_thr).astype(int)
-
-    final_pred = np.full(len(y), -1, dtype=int)
-    final_pred[s1_pred == 1] = 2
-    for i, idx in enumerate(idx_not_hm):
-        if s1_pred[idx] == 0:
-            final_pred[idx] = s2_pred_sub[i]
-
-    valid = final_pred != -1
-    m  = three_class_metrics(y[valid], final_pred[valid])
-    cm = confusion_matrix(y[valid], final_pred[valid], labels=[0, 1, 2])
-
-    print(f"  Two-stage ({label}):  "
-          f"macro_F1={m['macro_f1']:.4f}  "
-          f"F1_hm={m['f1_class2']:.4f}  "
-          f"P_hm={m['precision_class2']:.4f}  "
-          f"R_hm={m['recall_class2']:.4f}")
-
-    safe_label = label.replace(" ", "_").replace("/", "-")
-    plot_confusion(
-        y[valid], final_pred[valid],
-        [CLASS_NAMES[i] for i in range(3)],
-        f"Two-Stage End-to-End ({label}) — Confusion Matrix (OOF)",
-        os.path.join(IMG_DIR, f"final_confusion_{safe_label}.png"),
-    )
-
-    return {"label": label, "metrics": m, "confusion_matrix": cm.tolist()}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1021,46 +810,30 @@ def main() -> None:
 
     df    = pd.read_pickle(DATA_PATH)
     feats = load_features()
+    X     = df.drop(columns=[c for c in NON_FEATURE_COLS
+                              if c in df.columns], errors="ignore")[feats]
+    y     = df["hm_class"]
 
-    X = df.drop(columns=[c for c in NON_FEATURE_COLS if c in df.columns],
-                errors="ignore")[feats]
-    y = df["hm_class"]
-
-    print(f"\n{'═' * 60}")
-    print(f"  hm_class — One-Shot vs Two-Stage Comparison")
-    print(f"{'═' * 60}")
-    print(f"  Total samples: {len(y)}")
+    print(f"\n{'═'*60}")
+    print(f"  hm_class — One-Shot vs Binary Comparison")
+    print(f"{'═'*60}")
+    print(f"  Total: {len(y)}    Features: {len(feats)}")
     for cls, label in CLASS_NAMES.items():
-        print(f"  Class {cls} ({label}): {(y == cls).sum():6d}")
-    print(f"  Features: {len(feats)}")
+        print(f"  Class {cls} ({label}): {(y==cls).sum()}")
 
     # ── Approach 1 ────────────────────────────────────────────────────────
-    os_result = train_oneshot(X, y)
-    oneshot_p = os_result["oof_metrics"]["precision_class2"]
+    os_result  = train_oneshot(X, y, feats)
+    oneshot_p  = os_result["oof_metrics"]["precision_class2"]
 
     # ── Approach 2 ────────────────────────────────────────────────────────
-    s1 = train_stage1(X, y, feats, oneshot_precision=oneshot_p)
-    s2 = train_stage2(X, y, feats)
+    bin_result = train_binary(X, y, feats, oneshot_precision=oneshot_p)
 
-    # End-to-end at three thresholds
-    threshold_labels = {
+    # ── Comparison ────────────────────────────────────────────────────────
+    thr_labels = {
         "youden":     "Youden-J",
         "f1_opt":     "F1-optimal",
         "prec_match": "Precision-matched",
     }
-    e2e_results = {}
-    print(f"\n{'═' * 60}")
-    print(f"  END-TO-END COMPARISON")
-    print(f"{'═' * 60}")
-    for key, label in threshold_labels.items():
-        thr = s1["thresholds"][key]
-        e2e = evaluate_twostage_e2e(
-            y, s1["oof_prob"], thr,
-            s2["oof_prob"], s2["threshold"], label,
-        )
-        e2e_results[key] = e2e
-
-    # Comparison table
     comparison_rows = [{
         "model":        "One-shot (softmax)",
         "precision_hm": os_result["oof_metrics"]["precision_class2"],
@@ -1068,33 +841,29 @@ def main() -> None:
         "f1_hm":        os_result["oof_metrics"]["f1_class2"],
         "macro_f1":     os_result["oof_metrics"]["macro_f1"],
     }]
-    for key, label in threshold_labels.items():
-        m = e2e_results[key]["metrics"]
+    for key, label in thr_labels.items():
+        m = bin_result["metrics_per_thr"][key]
         comparison_rows.append({
-            "model":        f"Two-stage ({label})",
-            "precision_hm": m["precision_class2"],
-            "recall_hm":    m["recall_class2"],
-            "f1_hm":        m["f1_class2"],
+            "model":        f"Binary ({label})",
+            "precision_hm": m["precision_class1"],
+            "recall_hm":    m["recall_class1"],
+            "f1_hm":        m["f1_class1"],
             "macro_f1":     m["macro_f1"],
         })
 
-    print(f"\n{'═' * 72}")
-    print(f"  {'Model':<35} {'P_hm':>7} {'R_hm':>7} "
+    print(f"\n{'═'*70}")
+    print(f"  {'Model':<32} {'P_hm':>7} {'R_hm':>7} "
           f"{'F1_hm':>7} {'Macro_F1':>9}")
-    print(f"  {'─' * 65}")
+    print(f"  {'─'*64}")
     for row in comparison_rows:
-        print(f"  {row['model']:<35} "
-              f"{row['precision_hm']:>7.4f} "
-              f"{row['recall_hm']:>7.4f} "
-              f"{row['f1_hm']:>7.4f} "
-              f"{row['macro_f1']:>9.4f}")
-    print(f"{'═' * 72}")
+        print(f"  {row['model']:<32} "
+              f"{row['precision_hm']:>7.4f} {row['recall_hm']:>7.4f} "
+              f"{row['f1_hm']:>7.4f} {row['macro_f1']:>9.4f}")
+    print(f"{'═'*70}")
 
-    # Comparison figures
-    print(f"\n  Saving comparison figures → {IMG_DIR}/")
     plot_pr_comparison(
-        s1["oof_true"], s1["oof_prob"],
-        os_result["oof_metrics"], s1["thresholds"],
+        bin_result["oof_true"], bin_result["oof_prob"],
+        os_result["oof_metrics"], bin_result["thresholds"],
         os.path.join(IMG_DIR, "comparison_pr_curve.png"),
     )
     plot_comparison_bar(
@@ -1102,89 +871,69 @@ def main() -> None:
         os.path.join(IMG_DIR, "comparison_bar.png"),
     )
 
-    # Save models
-    print(f"\n  Saving models → {OUT_DIR}/")
+    # ── Save models ───────────────────────────────────────────────────────
     for seed in UNDERSAMPLE_SEEDS:
         joblib.dump(os_result["final_lgb"][seed],
                     os.path.join(OUT_DIR, f"oneshot_lgbm_seed{seed}.pkl"))
         joblib.dump(os_result["final_xgb"][seed],
                     os.path.join(OUT_DIR, f"oneshot_xgb_seed{seed}.pkl"))
-        joblib.dump(s1["final_lgb"][seed],
-                    os.path.join(OUT_DIR, f"stage1_lgbm_seed{seed}.pkl"))
-        joblib.dump(s1["final_xgb"][seed],
-                    os.path.join(OUT_DIR, f"stage1_xgb_seed{seed}.pkl"))
-    joblib.dump(s2["final_lgb"], os.path.join(OUT_DIR, "stage2_lgbm.pkl"))
-    joblib.dump(s2["final_xgb"], os.path.join(OUT_DIR, "stage2_xgb.pkl"))
+        joblib.dump(bin_result["final_lgb"][seed],
+                    os.path.join(OUT_DIR, f"binary_lgbm_seed{seed}.pkl"))
+        joblib.dump(bin_result["final_xgb"][seed],
+                    os.path.join(OUT_DIR, f"binary_xgb_seed{seed}.pkl"))
 
-    # Save metrics
-    save_json(s1["thresholds"],
+    # ── Save metrics ──────────────────────────────────────────────────────
+    save_json(bin_result["thresholds"],
               os.path.join(OUT_DIR, "thresholds.json"))
     save_json({
-        "oof_metrics":      os_result["oof_metrics"],
-        "confusion_matrix": os_result["confusion_matrix"],
-        "seed_cv": {str(s): summarize(os_result["seed_cv_metrics"][s])
-                    for s in UNDERSAMPLE_SEEDS},
+        "oof_metrics": os_result["oof_metrics"],
+        "confusion":   os_result["confusion"],
+        "seed_cv":     {str(s): summarize(os_result["seed_cv"][s])
+                        for s in UNDERSAMPLE_SEEDS},
     }, os.path.join(OUT_DIR, "oneshot_metrics.json"))
     save_json({
-        "metrics_per_threshold": s1["metrics_per_threshold"],
-        "thresholds":            s1["thresholds"],
-        "seed_cv": {str(s): summarize(s1["seed_cv_metrics"][s])
-                    for s in UNDERSAMPLE_SEEDS},
-    }, os.path.join(OUT_DIR, "stage1_metrics.json"))
+        "metrics_per_threshold": bin_result["metrics_per_thr"],
+        "thresholds":            bin_result["thresholds"],
+        "seed_cv":               {str(s): summarize(bin_result["seed_cv"][s])
+                                  for s in UNDERSAMPLE_SEEDS},
+    }, os.path.join(OUT_DIR, "binary_metrics.json"))
     save_json({
-        "oof_metrics": s2["oof_metrics"],
-        "cv_lgbm":     s2["cv_lgb"],
-        "cv_xgb":      s2["cv_xgb"],
-        "threshold":   s2["threshold"],
-    }, os.path.join(OUT_DIR, "stage2_metrics.json"))
-    save_json({
-        "comparison":   comparison_rows,
-        "oneshot":      os_result["oof_metrics"],
-        "twostage_e2e": {k: v["metrics"] for k, v in e2e_results.items()},
-        "n_features":   len(feats),
+        "comparison": comparison_rows,
+        "oneshot":    os_result["oof_metrics"],
+        "binary":     bin_result["metrics_per_thr"],
+        "n_features": len(feats),
     }, os.path.join(OUT_DIR, "hm_class_metrics.json"))
 
-    print(f"\n{'═' * 60}")
+    print(f"\n{'═'*60}")
     print(f"  Done.  All outputs in: {OUT_DIR}/")
-    print(f"{'═' * 60}")
+    print(f"{'═'*60}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # INFERENCE HELPER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def predict_hm_class(
-    X_new: pd.DataFrame,
-    model_dir: str = OUT_DIR,
+def predict_hm(
+    X_new:         pd.DataFrame,
+    model_dir:     str = OUT_DIR,
     threshold_key: str = "f1_opt",
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Two-stage inference.
+    Binary inference.
     threshold_key: 'youden' | 'f1_opt' | 'prec_match'
-    Returns (pred, proba_hm).
+    Returns (pred_binary, proba_halfmetal).
     """
     thr_all = json.load(open(os.path.join(model_dir, "thresholds.json")))
-    s1_thr  = thr_all[threshold_key]
-    s2_thr  = json.load(open(
-        os.path.join(model_dir, "stage2_metrics.json")
-    ))["threshold"]
+    thr     = thr_all[threshold_key]
 
-    s1_lgb = [joblib.load(os.path.join(model_dir,
-               f"stage1_lgbm_seed{s}.pkl")) for s in UNDERSAMPLE_SEEDS]
-    s1_xgb = [joblib.load(os.path.join(model_dir,
-               f"stage1_xgb_seed{s}.pkl")) for s in UNDERSAMPLE_SEEDS]
+    models = [
+        joblib.load(os.path.join(model_dir, f"binary_{m}_seed{s}.pkl"))
+        for m in ("lgbm", "xgb") for s in UNDERSAMPLE_SEEDS
+    ]
     proba_hm = np.mean(
-        [m.predict_proba(X_new)[:, 1] for m in s1_lgb + s1_xgb], axis=0,
+        [m.predict_proba(X_new)[:, 1] for m in models], axis=0
     )
-    is_hm = proba_hm >= s1_thr
-
-    s2_lgb = joblib.load(os.path.join(model_dir, "stage2_lgbm.pkl"))
-    s2_xgb = joblib.load(os.path.join(model_dir, "stage2_xgb.pkl"))
-    proba_ins = (s2_lgb.predict_proba(X_new)[:, 1] +
-                 s2_xgb.predict_proba(X_new)[:, 1]) / 2
-    s2_pred = (proba_ins >= s2_thr).astype(int)
-
-    return np.where(is_hm, 2, s2_pred), proba_hm
+    return (proba_hm >= thr).astype(int), proba_hm
 
 
 if __name__ == "__main__":
