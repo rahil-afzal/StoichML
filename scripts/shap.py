@@ -84,7 +84,7 @@ TASKS = {
         "features_key": "hm_class",
         "data_path":    "data/data_feat.pkl",
         "model_paths":  lambda: [
-            os.path.join(MODEL_DIR, "hm_class", f"stage1_lgbm_seed{s}.pkl")
+            os.path.join(MODEL_DIR, "hm_class", f"detector_lgb_seed{s}.pkl")
             for s in UNDERSAMPLE_SEEDS
         ],
         "shap_class":   1,                 # class 1 = half-metal
@@ -337,9 +337,9 @@ if __name__ == "__main__":
         description="Unified SHAP analysis for StoichML tasks.",
         epilog=(
             "Examples:\n"
-            "  python shap_analysis.py --task enthalpy\n"
-            "  python shap_analysis.py --task all\n"
-            "  python shap_analysis.py --task all --max_samples 5000"
+            "  python shap.py --task enthalpy\n"
+            "  python shap.py --task all\n"
+            "  python shap.py --task all --max_samples 5000"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
