@@ -550,15 +550,28 @@ def featurize(df, elements_col="elements", composition_col="composition"):
                     wf, period
         Stats per property: mean, std, min, max, mad, pos, hmean, gmean
 
-      18 physics features:
+      phys() returns 18 composition-level keys, but 5 of them —
+      chi_mad, mass_std, val_mean, dhalf_mean, unpaired_mean — share
+      their name with (and are numerically identical to) a stats()-derived
+      elemental column for the same base property. feats.update(phys(...))
+      therefore overwrites those 5 stats() columns in place rather than
+      adding new ones. Net unique composition-level contribution: 13
+      features:
         n_elements, n_atoms, max_weight,
         conf_entropy, S_mag, S_orb,
-        chi_mad, delta_chi, pair_chi, r_mad, mass_std,
-        val_mean, val_var, dhalf_mean,
-        tm_frac, f_frac,
-        unpaired_mean, unpaired_var
+        delta_chi, pair_chi, r_mad,
+        val_var, tm_frac, f_frac,
+        unpaired_var
 
-      = 194 features total  (was 151)
+      = 176 + 13 = 189 features total.
+
+      NOTE: this docstring previously stated 194 = 176 + 18, which counted
+      phys()'s 18 return keys without accounting for the 5-key overlap
+      above. That was a documentation error only — no feature values or
+      model inputs changed; the pipeline has always produced 189 unique
+      columns. The 5 overlapping phys() lines are dead code (their output
+      is discarded by the overwrite) but are left in place here pending a
+      decision on whether to remove or rename them.
     """
     out = []
 

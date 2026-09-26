@@ -2,16 +2,18 @@
 __pycache__/
 *.py[cod]
 
-# Data artifacts
+# Data artifacts (regenerable via scripts/run_featurize.py)
 data/data_feat.pkl
-data/selected_features.json
 egap_comparison
 # Jupyter
 .ipynb_checkpoints/
 data/test.ipynb
 
-# Model outputs
+# Model outputs (regenerable via scripts/model_*.py)
+# NOTE: this deliberately no longer contains a blanket "*.json" rule.
+# That rule also matched data/selected_features.json and the per-task
+# metrics JSONs in results/ — both are small, tracked result artifacts,
+# not generated scratch output, and should not be gitignored.
 models/
 shap_outputs/
 topk/
-*.json
