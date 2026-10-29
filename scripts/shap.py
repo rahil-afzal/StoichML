@@ -38,11 +38,12 @@ import matplotlib.pyplot as plt
 
 matplotlib.use("Agg")
 
+from stoichml.config import RANDOM_STATE, UNDERSAMPLE_SEEDS
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-RANDOM_STATE   = 42
 DATA_PATH      = "data/data_feat.pkl"
 FEATURES_JSON  = "data/selected_features.json"
 MODEL_DIR      = "models"
@@ -52,7 +53,8 @@ MAX_SAMPLES    = 10000
 TOP_K          = 10
 DPI            = 1500
 
-UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
+# RANDOM_STATE and UNDERSAMPLE_SEEDS now live in stoichml/config.py (imported
+# above) — values unchanged (42, [0, 7, 21, 42, 99]).
 
 # Task registry
 # type:       how to extract SHAP values

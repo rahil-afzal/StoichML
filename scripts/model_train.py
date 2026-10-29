@@ -26,7 +26,6 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.metrics import (
     mean_squared_error,
     mean_absolute_error,
@@ -42,19 +41,23 @@ from sklearn.metrics import (
 import lightgbm as lgb
 import xgboost as xgb
 
+from stoichml.config import N_SPLITS, RANDOM_STATE, UNDERSAMPLE_SEEDS
+from stoichml.utils import make_kfold, make_stratified_kfold
+from stoichml.utils import regression_metrics as _regression_metrics
+from stoichml.utils import save_json as _save_json
+from stoichml.utils import undersample_to_minority as _undersample_to_minority
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
-
-RANDOM_STATE = 42
-N_SPLITS     = 5
+#
+# RANDOM_STATE, N_SPLITS, UNDERSAMPLE_SEEDS now live in stoichml/config.py
+# (imported above) — values unchanged (42, 5, [0, 7, 21, 42, 99]).
 
 DATA_PATH     = "data/data_feat.pkl"
 FEATURES_JSON = "data/selected_features.json"
 OUT_DIR       = "models"
-
-UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
 
 TASKS = {
     "enthalpy": {
@@ -117,9 +120,8 @@ def summarize(metric_list: list[dict]) -> dict:
 
 
 def save_json(obj: dict, path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=4)
+    """Delegates to stoichml.utils.save_json (indent=4, matching prior default)."""
+    _save_json(obj, path, indent=4)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -127,11 +129,8 @@ def save_json(obj: dict, path: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    return {
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "mae":  float(mean_absolute_error(y_true, y_pred)),
-        "r2":   float(r2_score(y_true, y_pred)),
-    }
+    """Delegates to stoichml.utils.regression_metrics (MAE/RMSE/R2, unchanged)."""
+    return _regression_metrics(y_true, y_pred)
 
 
 def binary_metrics(y_true: np.ndarray, prob: np.ndarray, thr: float) -> dict:
@@ -169,23 +168,12 @@ def undersample_strict(
     """
     Strict 1:1 undersampling for egap_type.
     Downsamples all non-minority classes to the fold-local minority count.
-    Must be identical to feature_selection.py.
+
+    Delegates to stoichml.utils.undersample_to_minority(majority_cap=None),
+    which is the same logic that lived here directly before the Stage-1
+    refactor. Must be identical to stoichml/feature_selection.py.
     """
-    rng          = np.random.default_rng(seed)
-    idx_minority = y[y == minority_class].index
-    n_minority   = len(idx_minority)
-
-    balanced_idx = list(idx_minority)
-    for cls in sorted(y.unique()):
-        if cls == minority_class:
-            continue
-        idx_cls  = y[y == cls].index
-        n_sample = min(n_minority, len(idx_cls))
-        balanced_idx.extend(rng.choice(idx_cls, size=n_sample, replace=False))
-
-    balanced_idx = np.array(balanced_idx)
-    rng.shuffle(balanced_idx)
-    return X.loc[balanced_idx], y.loc[balanced_idx]
+    return _undersample_to_minority(X, y, minority_class, seed, majority_cap=None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -252,7 +240,7 @@ def train_regression(task_name: str, cfg: dict) -> None:
     print(f"  Features: {len(feats)}")
     print(f"  y range: [{y.min():.4f}, {y.max():.4f}]  mean: {y.mean():.4f}")
 
-    cv    = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    cv    = make_kfold()
     folds = list(cv.split(X_df))
 
     metrics_lgb    = []
@@ -371,7 +359,7 @@ def train_egap_type(task_name: str, cfg: dict) -> None:
     print(f"\n  Strategy: {N_SPLITS}-fold CV × {len(UNDERSAMPLE_SEEDS)} seeds "
           f"= {N_SPLITS * len(UNDERSAMPLE_SEEDS)} total models")
 
-    cv    = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    cv    = make_stratified_kfold()
     folds = list(cv.split(X, y))
 
     oof_probs_by_seed: dict[int, np.ndarray] = {}

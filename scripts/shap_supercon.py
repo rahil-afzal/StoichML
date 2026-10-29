@@ -36,11 +36,12 @@ import matplotlib.pyplot as plt
 
 matplotlib.use("Agg")
 
+from stoichml.config import RANDOM_STATE
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-RANDOM_STATE  = 42
 DATA_PATH     = "data/supercon_feat.pkl"
 FEATURES_JSON = "data/selected_features.json"
 MODEL_PATH    = "models/supercon/supercon_lgbm.pkl"
@@ -50,6 +51,9 @@ MAX_SAMPLES   = 10000
 TOP_K         = 10
 DPI           = 150
 MIN_BIN_SIZE  = 100   # skip bins with fewer samples
+
+# RANDOM_STATE now lives in stoichml/config.py (imported above) — value
+# unchanged (42).
 
 BINS      = [0, 10, 20, 40, 77, 100, 200]
 BIN_NAMES = ["0–10", "10–20", "20–40", "40–77", "77–100", "100+"]

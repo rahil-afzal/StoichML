@@ -45,8 +45,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold
+from sklearn.metrics import r2_score
+
+from stoichml.config import N_SPLITS, RANDOM_STATE
+from stoichml.utils import bin_analysis as _bin_analysis
+from stoichml.utils import make_kfold
+from stoichml.utils import regression_metrics as _regression_metrics
 
 matplotlib.use("Agg")
 # Source - https://stackoverflow.com/a/71692086
@@ -67,8 +71,8 @@ FEATURES_JSON = "data/selected_features.json"
 OUT_DIR       = Path("models/supercon")
 IMG_DIR       = OUT_DIR / "images"
 
-RANDOM_STATE = 42
-N_SPLITS     = 5
+# RANDOM_STATE and N_SPLITS now live in stoichml/config.py (imported above)
+# — values unchanged (42, 5).
 
 # Tc bins for per-bin analysis
 BINS       = [0, 10, 20, 40, 77, 100, 200]
@@ -131,36 +135,17 @@ def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> dict[str, float]:
-    return {
-        "mae":  float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "r2":   float(r2_score(y_true, y_pred)),
-    }
+    """Delegates to stoichml.utils.regression_metrics (MAE/RMSE/R2, unchanged)."""
+    return _regression_metrics(y_true, y_pred)
 
 
 def bin_analysis(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> list[dict]:
-    errors  = y_pred - y_true
-    bin_idx = np.clip(np.digitize(y_true, BINS) - 1, 0, len(BIN_LABELS) - 1)
-    stats   = []
-    for i, label in enumerate(BIN_LABELS):
-        mask = bin_idx == i
-        if mask.sum() == 0:
-            continue
-        n   = int(mask.sum())
-        e   = errors[mask]
-        r2b = float(r2_score(y_true[mask], y_pred[mask])) if n > 1 else float("nan")
-        stats.append({
-            "bin":      label,
-            "n":        n,
-            "mean_err": float(e.mean()),
-            "mae":      float(np.abs(e).mean()),
-            "rmse":     float(np.sqrt((e ** 2).mean())),
-            "r2":       r2b,
-        })
-    return stats
+    """Delegates to stoichml.utils.bin_analysis with this task's BINS/BIN_LABELS
+    (Tc bins in K — unchanged from the previous standalone implementation)."""
+    return _bin_analysis(y_true, y_pred, BINS, BIN_LABELS)
 
 
 def variance_decomposition(
@@ -211,7 +196,7 @@ def run_cv(
     y: np.ndarray,
     use_log: bool,
 ) -> dict:
-    cv    = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    cv    = make_kfold()
     folds = list(cv.split(X))
 
     oof_lgb          = np.zeros(len(y))

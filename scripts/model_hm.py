@@ -47,21 +47,23 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import StratifiedKFold
-
 import lightgbm as lgb
 import xgboost as xgb
+
+from stoichml.config import MAJORITY_CAP, N_SPLITS, RANDOM_STATE, UNDERSAMPLE_SEEDS
+from stoichml.utils import make_stratified_kfold
+from stoichml.utils import undersample_to_minority as _undersample_to_minority
 
 matplotlib.use("Agg")
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
+#
+# RANDOM_STATE, N_SPLITS, MAJORITY_CAP and UNDERSAMPLE_SEEDS now live in
+# stoichml/config.py (imported above) — values unchanged
+# (42, 5, 3000, [0, 7, 21, 42, 99]).
 
-RANDOM_STATE      = 42
-N_SPLITS          = 5
-MAJORITY_CAP      = 3000
-UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
 EARLY_STOP        = 200
 
 DATA_PATH     = Path("data/data_feat.pkl")
@@ -152,6 +154,25 @@ def xgb_clf(objective: str, n_classes: int | None = None) -> xgb.XGBClassifier:
 # ═══════════════════════════════════════════════════════════════════════
 
 def strict_11(X, y, minority_class, seed):
+    """
+    NOT consolidated into stoichml.utils.undersample_to_minority.
+
+    This loops over ALL classes (sorted, minority included) rather than
+    prepending the minority index before looping over the rest — a
+    genuinely different code path from the shared implementation.
+
+    Verified (tests/test_shared_utils.py) for its current use case (binary
+    y_bin in {0, 1}): for the same seed, this samples the exact same SET of
+    rows as undersample_to_minority(majority_cap=None), but returns them in
+    a DIFFERENT ROW ORDER (the pre-shuffle concatenation order differs —
+    majority-then-minority here vs. minority-then-majority there — so the
+    same random shuffle draws land differently). Sample content is
+    unaffected, but merging this into the shared utility would silently
+    change the row order used to fit LightGBM/XGBoost here, which could
+    shift results at the floating-point level and break bit-for-bit
+    reproducibility of previously saved runs. Left untouched pending an
+    explicit decision — see refactor report.
+    """
     rng        = np.random.default_rng(seed)
     n_minority = (y == minority_class).sum()
     idx        = []
@@ -166,16 +187,10 @@ def strict_11(X, y, minority_class, seed):
 
 
 def capped(X, y, minority_class, cap, seed):
-    rng = np.random.default_rng(seed)
-    idx = list(y[y == minority_class].index)
-    for cls in sorted(y.unique()):
-        if cls == minority_class:
-            continue
-        idx_cls = y[y == cls].index
-        idx.extend(rng.choice(idx_cls, size=min(cap, len(idx_cls)),
-                               replace=False))
-    rng.shuffle(idx)
-    return X.loc[idx], y.loc[idx]
+    """Delegates to stoichml.utils.undersample_to_minority(majority_cap=cap),
+    which is the same logic that lived here directly before the Stage-1
+    refactor. Must match stoichml/feature_selection.py's hm_class path."""
+    return _undersample_to_minority(X, y, minority_class, seed, majority_cap=cap)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -256,8 +271,7 @@ def precision_matched_threshold(y_true, prob, target_precision) -> float:
 
 def train_oneshot(X, y) -> dict:
     print(f"\n{'='*60}\n  BASELINE: One-shot ternary classifier\n{'='*60}")
-    cv    = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                            random_state=RANDOM_STATE)
+    cv    = make_stratified_kfold()
     folds = list(cv.split(X, y))
 
     oof_proba = np.zeros((len(y), 3))
@@ -334,8 +348,7 @@ def train_hm_detector(X, y_3class, feature_names) -> dict:
     print(f"\n{'='*60}\n  CONTRIBUTION: Binary HM detector\n{'='*60}")
     print(f"  HM: {n_hm} | Not-HM: {n_not} | Ratio {n_not/n_hm:.1f}:1")
 
-    cv         = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                                 random_state=RANDOM_STATE)
+    cv         = make_stratified_kfold()
     folds      = list(cv.split(X, y_bin))
     oof_lgb    = np.zeros(len(y_bin))
     oof_xgb    = np.zeros(len(y_bin))
@@ -424,8 +437,7 @@ def train_ci(X, y_3class) -> dict:
     print(f"\n{'='*60}\n  AUXILIARY: C/I classifier\n{'='*60}")
     print(f"  Non-HM: {len(ys)} | C: {(ys==0).sum()} | I: {(ys==1).sum()}")
 
-    cv         = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                                 random_state=RANDOM_STATE)
+    cv         = make_stratified_kfold()
     oof_lgb    = np.zeros(len(ys))
     oof_xgb    = np.zeros(len(ys))
     y_oof      = np.zeros(len(ys), dtype=int)

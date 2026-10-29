@@ -35,11 +35,11 @@ import pandas as pd
 from sklearn.metrics import (
     balanced_accuracy_score,
     f1_score,
-    mean_absolute_error,
-    mean_squared_error,
-    r2_score,
 )
-from sklearn.model_selection import KFold, StratifiedKFold
+from stoichml.config import N_SPLITS, RANDOM_STATE, UNDERSAMPLE_SEEDS
+from stoichml.utils import make_kfold, make_stratified_kfold
+from stoichml.utils import regression_metrics as _regression_metrics
+from stoichml.utils import undersample_to_minority as _undersample_to_minority
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -51,9 +51,9 @@ DATA_PATH        = "data/data_feat.pkl"
 SUPERCON_PATH    = "data/supercon_feat.pkl"
 
 K_LIST           = [5, 6, 7, 8, 9, 10, 11, 12]
-N_SPLITS         = 5
-RANDOM_STATE     = 42
-UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
+
+# N_SPLITS, RANDOM_STATE and UNDERSAMPLE_SEEDS now live in stoichml/config.py
+# (imported above) — values unchanged (5, 42, [0, 7, 21, 42, 99]).
 
 # Primary metric shown in the summary plot for each task
 PRIMARY_METRIC = {
@@ -87,11 +87,8 @@ def load_top_features(csv_path: str, k: int) -> list[str]:
 
 
 def reg_metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
-    return {
-        "mae":  float(mean_absolute_error(y, p)),
-        "rmse": float(np.sqrt(mean_squared_error(y, p))),
-        "r2":   float(r2_score(y, p)),
-    }
+    """Delegates to stoichml.utils.regression_metrics (MAE/RMSE/R2, unchanged)."""
+    return _regression_metrics(y, p)
 
 
 def clf_metrics(y: np.ndarray, p: np.ndarray) -> dict[str, float]:
@@ -107,22 +104,9 @@ def undersample_strict(
     minority_class: int,
     seed: int,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    rng     = np.random.default_rng(seed)
-    idx_min = list(y[y == minority_class].index)
-    n_min   = len(idx_min)
-    idx_all = list(idx_min)
-
-    for cls in sorted(y.unique()):
-        if cls == minority_class:
-            continue
-        idx_cls = y[y == cls].index
-        chosen  = rng.choice(idx_cls, size=min(n_min, len(idx_cls)),
-                             replace=False)
-        idx_all.extend(chosen)
-
-    idx_all = np.array(idx_all)
-    rng.shuffle(idx_all)
-    return X.loc[idx_all], y.loc[idx_all]
+    """Delegates to stoichml.utils.undersample_to_minority(majority_cap=None) —
+    same logic that lived here directly before the Stage-1 refactor."""
+    return _undersample_to_minority(X, y, minority_class, seed, majority_cap=None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,8 +148,7 @@ def _es_callbacks() -> list:
 
 def cv_regression(X: pd.DataFrame, y: pd.Series) -> list[dict]:
     """5-fold CV for regression. Eval set = fold validation (no inner split)."""
-    cv           = KFold(n_splits=N_SPLITS, shuffle=True,
-                         random_state=RANDOM_STATE)
+    cv           = make_kfold()
     fold_metrics = []
 
     for tr, va in cv.split(X):
@@ -186,8 +169,7 @@ def cv_regression(X: pd.DataFrame, y: pd.Series) -> list[dict]:
 
 def cv_binary(X: pd.DataFrame, y: pd.Series) -> list[dict]:
     """5-fold stratified CV for binary classification with seed ensemble."""
-    cv           = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                                   random_state=RANDOM_STATE)
+    cv           = make_stratified_kfold()
     fold_metrics = []
 
     for tr, va in cv.split(X, y):
@@ -220,8 +202,7 @@ def cv_twostage(X: pd.DataFrame, y: pd.Series) -> list[dict]:
     Threshold fixed at 0.5 for the top-k sensitivity analysis
     (threshold tuning is performed in the main hm_class pipeline).
     """
-    cv           = StratifiedKFold(n_splits=N_SPLITS, shuffle=True,
-                                   random_state=RANDOM_STATE)
+    cv           = make_stratified_kfold()
     fold_metrics = []
 
     for tr, va in cv.split(X, y):

@@ -35,11 +35,12 @@ import numpy as np
 import pandas as pd
 import shap
 
+from stoichml.config import RANDOM_STATE, UNDERSAMPLE_SEEDS
+
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG 
 # ══════════════════════════════════════════════════════════════════════════════
 
-RANDOM_STATE  = 42
 N_SHAP_SAMPLE = 10000          # matches "up to 10,000 compounds" in the paper
 CORR_THRESHOLD_DEFAULT = 0.8    # |Spearman r| above this = "correlated group"
 
@@ -49,7 +50,8 @@ FEATURES_JSON       = "data/selected_features.json"
 MODEL_DIR            = "models"
 OUT_DIR               = "shap_outputs"          # matches your existing convention
 
-UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
+# RANDOM_STATE and UNDERSAMPLE_SEEDS now live in stoichml/config.py (imported
+# above) — values unchanged (42, [0, 7, 21, 42, 99]).
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -52,10 +52,21 @@ OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 sys.path.insert(0, str(ROOT))
 from stoichml.featurizer import featurize
+from stoichml.config import CUM_IMPORTANCE as TAU
+from stoichml.config import N_SPLITS as CV_SPLITS
+from stoichml.config import RANDOM_STATE
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Hyperparameters  — identical to main model_egap deep configuration
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# TAU (cumulative-gain cutoff) and CV_SPLITS now come from stoichml/config.py
+# (imported above as CUM_IMPORTANCE / N_SPLITS) — values unchanged (0.85, 5).
+# RANDOM_STATE is likewise imported and unchanged (42); it is also still
+# hardcoded as the literal 42 inside LGBM_PARAMS/XGB_PARAMS below, which was
+# already the case before this refactor and is left as-is (see refactor
+# report — those inline literals were not touched to avoid editing
+# hyperparameter dicts).
 
 LGBM_PARAMS = dict(
     n_estimators      = 5000,
@@ -89,9 +100,6 @@ XGB_PARAMS = dict(
     EARLY_STOPPING_ROUNDS = 200,
 )
 
-CV_SPLITS    = 5
-RANDOM_STATE = 42
-TAU          = 0.85
 EARLY_STOP   = 200
 
 # ══════════════════════════════════════════════════════════════════════════════

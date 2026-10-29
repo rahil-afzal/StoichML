@@ -9,26 +9,32 @@ import lightgbm as lgb
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.utils.class_weight import compute_class_weight
 
+from .config import (
+    CUM_IMPORTANCE,
+    MAJORITY_CAP,
+    N_SPLITS as N_FOLDS,
+    RANDOM_STATE,
+    UNDERSAMPLE_SEEDS,
+)
+from .utils import save_json
+from .utils import undersample_to_minority as _undersample_to_minority
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════════════════════════════════════
-
-INPUT_PATH  = "data/data_feat.pkl"
-OUTPUT_JSON = "data/selected_features.json"
-
-RANDOM_STATE      = 42
-N_FOLDS           = 5
-CUM_IMPORTANCE    = 0.85
-
-# Must match seeds in train_egap_type_ensemble.py and train_hm_class_ensemble.py
-UNDERSAMPLE_SEEDS = [0, 7, 21, 42, 99]
-
-# Must match MAJORITY_CAP in train_hm_class_ensemble.py.
+#
+# RANDOM_STATE, N_FOLDS (=N_SPLITS), CUM_IMPORTANCE, UNDERSAMPLE_SEEDS and
+# MAJORITY_CAP now live in stoichml/config.py — imported above, values
+# unchanged (42, 5, 0.85, [0, 7, 21, 42, 99], 3000 respectively).
+#
+# MAJORITY_CAP must match MAJORITY_CAP in scripts/model_hm.py.
 # hm_class minority (class 2) has only 661 samples — strict 1:1:1
 # undersampling gives ~1,983 training rows which is too small for
 # 151 features. Cap majority classes at 3,000 each instead, giving
 # ~3,661 rows per model (ratio ≈ 4.5:4.5:1 vs original 63:12:1).
-MAJORITY_CAP = 3000
+
+INPUT_PATH  = "data/data_feat.pkl"
+OUTPUT_JSON = "data/selected_features.json"
 
 TARGETS = {
     "enthalpy": {
@@ -155,45 +161,19 @@ def undersample_to_minority(
 
       majority_cap=None  (egap_type, strict balancing)
         Each majority class is downsampled to the fold-local minority size.
-        Produces a perfectly balanced dataset.
-        n_minority computed from the fold, not the full dataset — avoids
-        ValueError when the fold minority count is smaller than the full
-        dataset majority count.
 
       majority_cap=N  (hm_class, capped undersampling)
         Each majority class is downsampled to min(N, available).
-        Minority class size is irrelevant to the cap — keeps all minority.
-        For hm_class with MAJORITY_CAP=3000:
-          ~3,661 rows per model (4.5:4.5:1) vs 1,983 for strict 1:1:1.
 
-    Must produce identical subsets to train_egap_type_ensemble.py and
-    train_hm_class_ensemble.py for the same seed.
+    Delegates to stoichml.utils.undersample_to_minority (Stage-1 refactor:
+    this was previously a standalone implementation here; logic is
+    unchanged — see stoichml/utils.py for the canonical version and the
+    other call sites it now replaces).
+
+    Must produce identical subsets to scripts/model_train.py and
+    scripts/model_hm.py for the same seed.
     """
-    rng          = np.random.default_rng(seed)
-    idx_minority = y[y == minority_class].index
-    n_minority   = len(idx_minority)      # fold-local count
-
-    balanced_idx = list(idx_minority)
-
-    for cls in sorted(y.unique()):
-        if cls == minority_class:
-            continue
-        idx_cls = y[y == cls].index
-
-        if majority_cap is None:
-            # Strict balancing — match minority size, guard against small folds
-            n_sample = min(n_minority, len(idx_cls))
-        else:
-            # Capped — draw up to majority_cap regardless of minority size
-            n_sample = min(majority_cap, len(idx_cls))
-
-        sampled = rng.choice(idx_cls, size=n_sample, replace=False)
-        balanced_idx.extend(sampled)
-
-    balanced_idx = np.array(balanced_idx)
-    rng.shuffle(balanced_idx)
-
-    return X.loc[balanced_idx], y.loc[balanced_idx]
+    return _undersample_to_minority(X, y, minority_class, seed, majority_cap)
 
 
 def lgbm_model(task: str, y: pd.Series, balanced: bool = False):
@@ -458,7 +438,6 @@ if __name__ == "__main__":
     for name in tasks_to_run:
         results = run_task(name, results)   # ← no df argument
 
-    with open(OUTPUT_JSON, "w") as f:
-        json.dump(results, f, indent=2)
+    save_json(results, OUTPUT_JSON, indent=2)
 
     print(f"\nSaved → {OUTPUT_JSON}")

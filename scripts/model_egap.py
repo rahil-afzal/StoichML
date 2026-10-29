@@ -57,26 +57,29 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 from scipy.stats import wilcoxon
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
+
+from stoichml.config import N_SPLITS, RANDOM_STATE
+from stoichml.utils import bin_analysis as _bin_analysis
+from stoichml.utils import make_kfold
+from stoichml.utils import regression_metrics as _regression_metrics
 
 matplotlib.use("Agg")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
+#
+# RANDOM_STATE and N_SPLITS now live in stoichml/config.py (imported above)
+# — values unchanged (42, 5).
 
 OUT_DIR = Path("models/egap")
 IMG_DIR = OUT_DIR / "images"
 
 BINS       = [0.0, 0.5, 1.0, 2.0, 4.0, 6.0, 9.5]
 BIN_LABELS = ["0–0.5", "0.5–1", "1–2", "2–4", "4–6", "6–9.5"]
-
-RANDOM_STATE = 42
-N_SPLITS     = 5
 
 # Hyperparameter table printed at startup for reproducibility
 HPARAM_TABLE = """
@@ -200,11 +203,8 @@ def compute_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> dict[str, float]:
-    return {
-        "mae":  float(mean_absolute_error(y_true, y_pred)),
-        "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
-        "r2":   float(r2_score(y_true, y_pred)),
-    }
+    """Delegates to stoichml.utils.regression_metrics (MAE/RMSE/R2, unchanged)."""
+    return _regression_metrics(y_true, y_pred)
 
 
 def summarize_cv(
@@ -254,28 +254,9 @@ def bin_analysis(
     y_true: np.ndarray,
     y_pred: np.ndarray,
 ) -> list[dict]:
-    errors  = y_pred - y_true
-    bin_idx = np.clip(
-        np.digitize(y_true, BINS) - 1, 0, len(BIN_LABELS) - 1
-    )
-    stats = []
-    for i, label in enumerate(BIN_LABELS):
-        mask = bin_idx == i
-        if mask.sum() == 0:
-            continue
-        n   = int(mask.sum())
-        e   = errors[mask]
-        r2b = (float(r2_score(y_true[mask], y_pred[mask]))
-               if n > 1 else float("nan"))
-        stats.append({
-            "bin":      label,
-            "n":        n,
-            "mean_err": float(e.mean()),
-            "mae":      float(np.abs(e).mean()),
-            "rmse":     float(np.sqrt((e ** 2).mean())),
-            "r2":       r2b,
-        })
-    return stats
+    """Delegates to stoichml.utils.bin_analysis with this task's BINS/BIN_LABELS
+    (eV bins — unchanged from the previous standalone implementation)."""
+    return _bin_analysis(y_true, y_pred, BINS, BIN_LABELS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -296,7 +277,7 @@ def run_cv_gbm(
     Returns OOF predictions, per-fold metrics, best iterations,
     and fold-level feature importances.
     """
-    cv    = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    cv    = make_kfold()
     folds = list(cv.split(X))
 
     oof_lgb          = np.zeros(len(y))
@@ -369,7 +350,7 @@ def run_cv_svr(
     y: np.ndarray,
 ) -> np.ndarray:
     """5-fold CV for SVR RBF. Returns OOF predictions only."""
-    cv  = KFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    cv  = make_kfold()
     oof = np.zeros(len(y))
 
     print(f"\n  SVR RBF (reference)  — this may take several minutes ...")
